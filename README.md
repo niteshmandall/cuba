@@ -120,3 +120,26 @@ Everyone is welcome to help translate into more languages!
 - Quality checks, suggestions, and optional machine translation.  
 
 🙌 Thanks to all translators for making this project available to more people!
+
+## Admin Script Standardization & Execution
+
+To securely and consistently execute maintenance scripts (e.g., resolving support tickets, data migrations) against different environments without needing local database credentials, we use a manual GitHub Actions workflow.
+
+### Writing an Admin Script
+
+1. **Location:** Place all one-off admin scripts inside the `scripts/tickets/` directory.
+2. **Environment Variables:** Scripts MUST read database credentials from environment variables (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), not hardcoded strings.
+3. **Auditability:** Include clear `console.log()` statements indicating the start, progress, and end states. This ensures the output is readable in the GitHub Actions console.
+4. **Example:** See `scripts/tickets/rename_school.ts`.
+
+### Running an Admin Script via GitHub Actions
+
+1. Navigate to the **Actions** tab in the GitHub repository.
+2. Select the **Run Admin Script** workflow from the left sidebar.
+3. Click the **Run workflow** dropdown on the right.
+4. Fill in the required fields:
+   * **Target Environment:** Choose `dev` or `prod` (this automatically injects the correct `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` repository secrets).
+   * **Path to Script:** Enter the exact path, e.g., `scripts/tickets/rename_school.ts`.
+   * **Optional arguments:** Pass any necessary arguments for the script, e.g., `--schoolId=123 --newName="New Name"`.
+5. Click **Run workflow**. 
+6. Click into the workflow run to monitor the `Set Environment Variables and Run Script` step for real-time progress and logs.
