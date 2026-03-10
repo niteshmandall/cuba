@@ -11,7 +11,7 @@ on:
           - dev
           - prod
       script_path:
-        description: 'Path to Script (e.g. scripts/tickets/rename_school.ts)'
+        description: 'Path to Script (e.g. scripts/tickets/example/rename_school.py)'
         required: true
         type: string
       arguments:
@@ -26,13 +26,16 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: 24.x
+          python-version: '3.12'
 
       - name: Install app dependencies
-        run: npm install
+        run: |
+          if [ -f "scripts/tickets/requirements.txt" ]; then pip install -r scripts/tickets/requirements.txt; fi
 
       - name: Set Environment Variables and Run Script
         env:
@@ -41,5 +44,7 @@ jobs:
         run: |
           echo "Starting script execution for environment: ${{ github.event.inputs.environment }}"
           echo "Script: ${{ github.event.inputs.script_path }}"
-          npx -y tsx ${{ github.event.inputs.script_path }} ${{ github.event.inputs.arguments }}
+          
+          python -u ${{ github.event.inputs.script_path }} ${{ github.event.inputs.arguments }}
+          
           echo "Script execution completed."
