@@ -39,11 +39,22 @@ jobs:
 
       - name: Set Environment Variables and Run Script
         env:
-          SUPABASE_URL: ${{ github.event.inputs.environment == 'prod' && secrets.PROD_SUPABASE_URL || secrets.DEV_SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ github.event.inputs.environment == 'prod' && secrets.PROD_SUPABASE_SERVICE_ROLE_KEY || secrets.DEV_SUPABASE_SERVICE_ROLE_KEY }}
+          PYTHONUNBUFFERED: "1"
+          PROD_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          PROD_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.PROD_SUPABASE_SERVICE_ROLE_KEY }}
+          DEV_SUPABASE_URL: ${{ secrets.DEV_SUPABASE_URL }}
+          DEV_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.DEV_SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           echo "Starting script execution for environment: ${{ github.event.inputs.environment }}"
           echo "Script: ${{ github.event.inputs.script_path }}"
+          
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            export SUPABASE_URL="$PROD_SUPABASE_URL"
+            export SUPABASE_SERVICE_ROLE_KEY="$PROD_SUPABASE_SERVICE_ROLE_KEY"
+          else
+            export SUPABASE_URL="$DEV_SUPABASE_URL"
+            export SUPABASE_SERVICE_ROLE_KEY="$DEV_SUPABASE_SERVICE_ROLE_KEY"
+          fi
           
           python -u ${{ github.event.inputs.script_path }} ${{ github.event.inputs.arguments }}
           
