@@ -123,7 +123,8 @@
     "test": "craco test",
     "eject": "craco eject",
     "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build --output-dir build/storybook"
+    "build-storybook": "storybook build --output-dir build/storybook",
+    "sonar": "sonar-scanner"
   },
   "eslintConfig": {
     "extends": [
@@ -176,6 +177,7 @@
     "jest-environment-jsdom": "^30.2.0",
     "prop-types": "^15.8.1",
     "shx": "^0.4.0",
+    "sonar-scanner": "^3.1.0",
     "storybook": "^8.6.14",
     "storybook-react-i18next": "^3.0.1",
     "ts-jest": "^29.4.6",
