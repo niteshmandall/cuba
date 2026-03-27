@@ -9,6 +9,7 @@ import {
 import SelectIconImage from "../displaySubjects/SelectIconImage";
 import { ServiceConfig } from "../../services/ServiceConfig";
 import { Util } from "../../utility/util";
+import { LessonNode } from "../../hooks/useLearningPath";
 
 interface CourseDetails {
   course: TableTypes<"course">;
@@ -145,7 +146,9 @@ const DropdownMenu: FC<DropdownMenuProps> = ({
         return;
       }
 
-      const learningPath = JSON.parse(currentStudent.learning_path);
+      const pathToParse = Util.getLatestLearningPathByUpdatedAt(currentStudent);
+      let learningPath = pathToParse ? JSON.parse(pathToParse) : null;
+      if(!learningPath) return;
       const { courseList } = learningPath.courses;
       const currentIndex = learningPath.courses.currentCourseIndex ?? 0;
 
@@ -231,11 +234,13 @@ const DropdownMenu: FC<DropdownMenuProps> = ({
       const currentStudent = Util.getCurrentStudent();
       if (!currentStudent?.learning_path) return;
 
-      const learningPath = JSON.parse(currentStudent.learning_path);
+      const pathToParse = Util.getLatestLearningPathByUpdatedAt(currentStudent);
+      let learningPath = pathToParse ? JSON.parse(pathToParse) : null;
+      if(!learningPath) return;
       const { courseList, currentCourseIndex } = learningPath.courses;
 
       const prevCourse = courseList[currentCourseIndex];
-      const prevPathItem = prevCourse?.path?.[prevCourse.currentIndex];
+      const prevPathItem = prevCourse?.path?.find((p : LessonNode) => p.isPlayed === false);
 
       const prevCourseId = prevCourse?.course_id;
       const prevLessonId = prevPathItem?.lesson_id;
@@ -243,6 +248,7 @@ const DropdownMenu: FC<DropdownMenuProps> = ({
       const prevPathId = prevCourse?.path_id;
 
       learningPath.courses.currentCourseIndex = index;
+      learningPath.updated_at = new Date().toISOString();
 
       Util.setCurrentStudent(
         { ...currentStudent, learning_path: JSON.stringify(learningPath) },
@@ -254,7 +260,7 @@ const DropdownMenu: FC<DropdownMenuProps> = ({
       );
 
       const currentCourse = courseList[index];
-      const currentPathItem = currentCourse?.path?.[currentCourse.currentIndex];
+      const currentPathItem = currentCourse?.path?.find((p : LessonNode) => p.isPlayed === false);
 
       const eventData = {
         user_id: currentStudent.id,

@@ -94,6 +94,8 @@ export enum TABLES {
   Locale = "locale",
   LanguageLocale = "language_locale",
   SubjectLesson = "subject_lesson",
+  StickerBook = "sticker_book",
+  UserStickerBook = "user_sticker_book"
 }
 export enum CLASS_USERS {
   STUDENTS = "Students",
@@ -521,6 +523,9 @@ export enum PAGES {
   ADD_SCHOOL_PAGE = "/add-school-page",
   ACTIVITIES_PAGE = "/activities-page",
   SCHOOL_ACTIVITIES = "/school-activities",
+  QR_ASSIGNMENTS = "/qr_assignments",
+  TEACHER_RECOMMENDED_ASSIGNMENTS = "/teacher-recommended-assignments",
+  COLORING_BOARD = "/coloring-board",
 }
 
 export const enum ASSIGNMENT_TYPE {
@@ -644,8 +649,10 @@ export const CURRENT_SCHOOL = "currentSchool";
 export const SEARCH_LESSON_HISTORY = "search_lesson_history";
 export const SEARCH_LESSON_CACHE_KEY = "search_lesson_last_state";
 export const CURRENT_MODE = "currentMode";
+export const LAST_MODE = "lastMode";
 export const CURRENT_CLASS = "currentClass";
 export const LANGUAGE = "language";
+export const LANG_REFRESHED = "langRefreshed";
 export const EXAM = "exam";
 export const PRE_QUIZ = "PreQuiz";
 export const GRADE_MAP = "GradeMap";
@@ -671,8 +678,7 @@ export const CURRENT_TEACHER = "currentTeacher";
 export const CURRENT_COURSE = "currentCourse";
 export const NAVIGATION_STATE = "navigationState";
 export const STARS_COUNT = "starsCount";
-export const LATEST_STARS = (studentId: string) =>
-  `latestStar_${studentId}`;
+export const LATEST_STARS = (studentId: string) => `latestStar_${studentId}`;
 export const IS_OPS_USER = "isOpsUser";
 export const EDIT_STUDENTS_MAP = "editStudentsMap";
 export const SHOW_GENERIC_POPUP = "SHOW_GENERIC_POPUP";
@@ -916,9 +922,6 @@ export const CAMPAIGN_SEQUENCE_FINISHED = "CAMPAIGN_SEQUENCE_FINISHED";
 export const LIDO_COMMON_AUDIO_DIR = "Lido-CommonAudios";
 export const LIDO_COMMON_AUDIO_LANG_KEY = "lido_common_audio_language";
 export const HOT_UPDATE_STATE_KEY = "hotUpdateState";
-
-
-
 
 export type LeaderboardBadge = {
   id: string;
@@ -1291,9 +1294,10 @@ export const LEARNING_PATHWAY_MODE = {
 
 export const CURRENT_PATHWAY_MODE = "currentPathwayMode";
 export const FAIL_STREAK_KEY = "failStreakCount";
-export const LANG_REFRESHED = "langRefreshed"
 export enum RESULT_STATUS {
   COMPLETED = "completed",
   USER_EXIT = "user_exit",
   SYSTEM_EXIT = "system_exit",
 }
+// Used this LATEST_LEARNING_PATH to store with updateLearningPath() api and get latest learning path with Util.getLatestLearningPathByUpdatedAt() from session storage to solve sqlite updates late issue.
+export const LATEST_LEARNING_PATH = "latest_learning_path";

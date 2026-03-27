@@ -55,9 +55,9 @@ import {
   DEFAULT_LOCALE_ID,
   SCHOOL,
   CLASS,
-  LANG_REFRESHED,
   RESULT_STATUS,
   LIDO_ASSESSMENT,
+  LATEST_LEARNING_PATH,
 } from "../../common/constants";
 import { StudentLessonResult } from "../../common/courseConstants";
 import { AvatarObj } from "../../components/animation/Avatar";
@@ -65,7 +65,7 @@ import Course from "../../models/course";
 import Lesson from "../../models/lesson";
 import LiveQuizRoomObject from "../../models/liveQuizRoom";
 import User from "../../models/user";
-import { LeaderboardInfo, ServiceApi } from "./ServiceApi";
+import { AssignmentCartData, LeaderboardInfo, ServiceApi } from "./ServiceApi";
 import {
   SQLiteDBConnection,
   SQLiteConnection,
@@ -88,14 +88,23 @@ import {
   UserSchoolClassResult,
 } from "../../ops-console/pages/NewUserPageOps";
 import { FCSchoolStats } from "../../ops-console/pages/SchoolDetailsPage";
-import { PaginatedResponse, SchoolNote } from "../../interface/modelInterfaces";
-
+import {
+  PaginatedResponse,
+  SchoolNote,
+  StickerBook,
+  UserStickerProgress,
+} from "../../interface/modelInterfaces";
+import {
+  readAssignmentCartFromStorage,
+  writeAssignmentCartToStorage,
+} from "../../teachers-module/pages/AssignmentCartStorage";
+import { runBackgroundWorkerStreamingSync } from "../../workers/backgroundWorkerClient";
 export class SqliteApi implements ServiceApi {
   public static i: SqliteApi;
   private _db: SQLiteDBConnection | undefined;
   private _sqlite: SQLiteConnection | undefined;
   private DB_NAME = "db_issue10";
-  private DB_VERSION = 10;
+  private DB_VERSION = 12;
   private _serverApi: SupabaseApi;
   private _currentMode: MODES;
   private _currentStudent: TableTypes<"user"> | undefined;
@@ -115,6 +124,8 @@ export class SqliteApi implements ServiceApi {
     return SqliteApi.i;
   }
 
+  private _syncInProgress: boolean = false;
+  private _syncRequestedAgain: boolean = false;
   public static async getInstance(): Promise<SqliteApi> {
     if (!SqliteApi.i) {
       SqliteApi.i = new SqliteApi();
@@ -517,20 +528,24 @@ export class SqliteApi implements ServiceApi {
     let data = new Map<string, any[]>();
     if (isInitialFetch === true) {
       let attempt = 1;
-      try {
-        data = await this._serverApi.getTablesData(
-          orderedTableNames,
-          lastPullTables,
-          isInitialFetch,
-        );
-      } catch (err) {
-        console.error(`❌ Attempt ${attempt}: getTablesData failed`, err);
-        if (attempt < 5) {
-          const delay = 500 * Math.pow(2, attempt);
-          await new Promise((res) => setTimeout(res, delay));
-          return this.pullChanges(tableNames, isFirstSync);
-        } else {
-          console.warn("❌ All 5 retries failed. Truncating local tables...");
+      const maxAttempts = 5;
+      while (true) {
+        try {
+          data = await this._serverApi.getTablesData(
+            orderedTableNames,
+            lastPullTables,
+            isInitialFetch,
+          );
+          break;
+        } catch (err) {
+          console.error(`❌ Attempt ${attempt}: getTablesData failed`, err);
+          if (attempt < maxAttempts) {
+            const delay = 500 * Math.pow(2, attempt);
+            await new Promise((res) => setTimeout(res, delay));
+            attempt += 1;
+            continue;
+          }
+          console.warn("❌ All retries failed. Truncating local tables...");
           if (!this._db) return;
           const query = `PRAGMA foreign_keys=OFF;`;
           const result = await this._db?.query(query);
@@ -551,11 +566,11 @@ export class SqliteApi implements ServiceApi {
           );
           if (userWantsRetry) {
             console.warn("🔁 Final retry triggered by user.");
-            return this.pullChanges(tableNames, isFirstSync); // restart pullChanges
-          } else {
-            console.warn("⛔ User canceled final retry.");
-            return; // do nothing
+            attempt = 1;
+            continue;
           }
+          console.warn("⛔ User canceled final retry.");
+          return;
         }
       }
     } else {
@@ -566,85 +581,115 @@ export class SqliteApi implements ServiceApi {
       );
     }
     const lastPulled = new Date().toISOString();
-    // let batchQueries: { statement: string; values: any[] }[] = [];
+    const DEFAULT_DB_BATCH_SIZE = 100;
+    const SAFE_USER_BATCH_SIZE = 250;
+    const STREAM_ROWS_CHUNK = 200;
+    const tablesForWorker: Record<string, any[]> = {};
+    const tableColumnsByName: Record<string, string[]> = {};
+    const tablesWritten = new Set<string>();
     for (const tableName of orderedTableNames) {
       const tableData = data.get(tableName) ?? [];
       if (tableData.length === 0) continue;
-
       const existingColumns = await this.getTableColumns(tableName);
       if (!existingColumns || existingColumns.length === 0) continue;
+      tablesForWorker[tableName] = tableData;
+      tableColumnsByName[tableName] = existingColumns;
+      tablesWritten.add(tableName);
+    }
 
-      const isUserTable = tableName === TABLES.User;
-      const BATCH_SIZE = isUserTable ? tableData.length : 100;
-      let batchQueries: { statement: string; values: any[] }[] = [];
-
-      for (const row of tableData) {
-        const fieldNames = Object.keys(row).filter((f) =>
-          existingColumns.includes(f),
-        );
-        if (fieldNames.length === 0) continue;
-
-        const fieldValues = fieldNames.map((f) => row[f]);
-        const placeholders = fieldNames.map(() => "?").join(", ");
-        const updateSetClause = fieldNames
-          .filter((f) => f !== "id")
-          .map((f) => `${f} = excluded.${f}`)
-          .join(", ");
-
-        const stmt = `
-          INSERT INTO ${tableName} (${fieldNames.join(", ")})
-          VALUES (${placeholders})
-          ON CONFLICT(id) DO UPDATE SET
-          ${updateSetClause}
-          WHERE excluded.updated_at > ${tableName}.updated_at;
-          `;
-
-        batchQueries.push({ statement: stmt, values: fieldValues });
-
-        // flush early
-        if (batchQueries.length >= BATCH_SIZE) {
+    try {
+      await runBackgroundWorkerStreamingSync(
+        {
+          tables: tablesForWorker,
+          tableColumns: tableColumnsByName,
+          defaultBatchSize: DEFAULT_DB_BATCH_SIZE,
+          userTableName: TABLES.User,
+          userTableBatchSize: SAFE_USER_BATCH_SIZE,
+          rowsPerChunk: STREAM_ROWS_CHUNK,
+        },
+        async (batch) => {
+          if (!batch.length) return;
           if (Capacitor.getPlatform() === "web") {
-            for (const q of batchQueries) {
-              await this._db.run(q.statement, q.values);
+            for (const q of batch) {
+              await this._db!.run(q.statement, q.values);
             }
             await this._sqlite?.saveToStore(this.DB_NAME);
           } else {
-            await this._db.executeSet(batchQueries);
+            await this._db!.executeSet(batch);
           }
-          batchQueries = [];
+        },
+      );
+    } catch (workerError) {
+      console.warn(
+        "Falling back to main-thread sync batch generation after worker failure:",
+        workerError,
+      );
+      for (const tableName of Object.keys(tablesForWorker)) {
+        const existingColumns = tableColumnsByName[tableName] ?? [];
+        const tableData = tablesForWorker[tableName] ?? [];
+        if (!existingColumns.length || !tableData.length) continue;
+        const isUserTable = tableName === TABLES.User;
+        const batchSize = isUserTable ? SAFE_USER_BATCH_SIZE : DEFAULT_DB_BATCH_SIZE;
+        let batchQueries: { statement: string; values: any[] }[] = [];
+        for (const row of tableData) {
+          const fieldNames = Object.keys(row).filter((f) =>
+            existingColumns.includes(f),
+          );
+          if (fieldNames.length === 0) continue;
+          const fieldValues = fieldNames.map((f) => row[f]);
+          const placeholders = fieldNames.map(() => "?").join(", ");
+          const updateSetClause = fieldNames
+            .filter((f) => f !== "id")
+            .map((f) => `${f} = excluded.${f}`)
+            .join(", ");
+          const stmt = `
+            INSERT INTO ${tableName} (${fieldNames.join(", ")})
+            VALUES (${placeholders})
+            ON CONFLICT(id) DO UPDATE SET
+            ${updateSetClause}
+            WHERE excluded.updated_at > ${tableName}.updated_at;
+            `;
+          batchQueries.push({ statement: stmt, values: fieldValues });
+          if (batchQueries.length >= batchSize) {
+            if (Capacitor.getPlatform() === "web") {
+              for (const q of batchQueries) {
+                await this._db!.run(q.statement, q.values);
+              }
+              await this._sqlite?.saveToStore(this.DB_NAME);
+            } else {
+              await this._db!.executeSet(batchQueries);
+            }
+            batchQueries = [];
+          }
+        }
+        if (batchQueries.length > 0) {
+          if (Capacitor.getPlatform() === "web") {
+            for (const q of batchQueries) {
+              await this._db!.run(q.statement, q.values);
+            }
+            await this._sqlite?.saveToStore(this.DB_NAME);
+          } else {
+            await this._db!.executeSet(batchQueries);
+          }
         }
       }
+    }
 
-      // flush leftovers
-      if (batchQueries.length > 0) {
-        if (Capacitor.getPlatform() === "web") {
-          for (const q of batchQueries) {
-            await this._db.run(q.statement, q.values);
-          }
-          await this._sqlite?.saveToStore(this.DB_NAME);
-        } else {
-          await this._db.executeSet(batchQueries);
-        }
-      }
-
-      // update sync timestamp per table
+    for (const tableName of tablesWritten) {
       await this.executeQuery(
         `INSERT OR REPLACE INTO pull_sync_info (table_name, last_pulled) VALUES (?, ?)`,
         [tableName, lastPulled],
       );
     }
 
-    // Update debug info
+    // Update debug info (avoid expensive full JSON serialization on hot path).
     let totalpulledRows = 0;
-    let filteredObject = {};
-    for (const [key, value] of data.entries()) {
+    for (const value of data.values()) {
       if (Array.isArray(value) && value.length > 0) {
         totalpulledRows += value.length;
-        filteredObject[key] = value; // include only non-empty arrays
       }
     }
-    const jsonString = JSON.stringify(filteredObject);
-    const pulledRowsSizeInBytes = new TextEncoder().encode(jsonString).length;
+    const pulledRowsSizeInBytes = totalpulledRows * 128;
     this.updateDebugInfo(0, totalpulledRows, pulledRowsSizeInBytes);
     // if (batchQueries.length > 0) {
     //   try {
@@ -775,8 +820,10 @@ export class SqliteApi implements ServiceApi {
             user_id: _currentUser?.id,
             ...mutate?.error,
           });
-          if (mutate?.error?.code === "23505") {
+          if (mutate?.error?.code === "23505" || mutate?.status === 409) {
+            console.log("🟢 Duplicate key ignored (already exists on server)");
           } else {
+            console.log("🔴 Real push error:", mutate?.error);
             return false;
           }
         }
@@ -800,34 +847,58 @@ export class SqliteApi implements ServiceApi {
     is_sync_immediate: boolean = true,
   ) {
     if (!this._db) return;
-    const refresh_tables = "'" + refreshTables.join("', '") + "'";
-    console.log("logs to check synced tables", JSON.stringify(refresh_tables));
-    await this.executeQuery(
-      `UPDATE pull_sync_info SET last_pulled = '2024-01-01 00:00:00' WHERE table_name IN (${refresh_tables})`,
-    );
-    const tablePullSync = await this.executeQuery(
-      `SELECT * FROM pull_sync_info WHERE table_name = '${TABLES.User}';`,
-    );
-    const lastUserUpdatedStr =
-      tablePullSync?.values?.[0]?.last_pulled ?? "2024-01-01 00:00:00";
-
-    const lastUserUpdated = new Date(lastUserUpdatedStr);
-    const now = new Date();
-    const diffMs = now.getTime() - lastUserUpdated.getTime();
-    const diffMinutes = diffMs / (1000 * 60);
-    if (diffMinutes > 5 || is_sync_immediate || refreshTables.length > 0) {
-      await this.pullChanges(tableNames, isFirstSync);
-      const res = await this.pushChanges(Object.values(TABLES));
-      const tables = "'" + tableNames.join("', '") + "'";
-      // console.log("logs to check synced tables1", JSON.stringify(tables));
-      const currentTimestamp = new Date();
-      const reducedTimestamp = new Date(currentTimestamp); // clone it
-      reducedTimestamp.setMinutes(reducedTimestamp.getMinutes() - 1);
-      const formattedTimestamp = reducedTimestamp.toISOString();
-      this.executeQuery(
-        `UPDATE pull_sync_info SET last_pulled = '${formattedTimestamp}'  WHERE table_name IN (${tables})`,
+    // 🔒 LOCK
+    if (this._syncInProgress) {
+      console.log("🟡 Sync already running → scheduling another run");
+      this._syncRequestedAgain = true;
+      return true;
+    }
+    this._syncInProgress = true;
+    try {
+      const refresh_tables = "'" + refreshTables.join("', '") + "'";
+      console.log(
+        "logs to check synced tables",
+        JSON.stringify(refresh_tables),
       );
-      return res;
+      await this.executeQuery(
+        `UPDATE pull_sync_info SET last_pulled = '2024-01-01 00:00:00' WHERE table_name IN (${refresh_tables})`,
+      );
+      const tablePullSync = await this.executeQuery(
+        `SELECT * FROM pull_sync_info WHERE table_name = '${TABLES.User}';`,
+      );
+      const lastUserUpdatedStr =
+        tablePullSync?.values?.[0]?.last_pulled ?? "2024-01-01 00:00:00";
+
+      const lastUserUpdated = new Date(lastUserUpdatedStr);
+      const now = new Date();
+      const diffMs = now.getTime() - lastUserUpdated.getTime();
+      const diffMinutes = diffMs / (1000 * 60);
+      if (diffMinutes > 5 || is_sync_immediate || refreshTables.length > 0) {
+        await this.pullChanges(tableNames, isFirstSync);
+        const res = await this.pushChanges(Object.values(TABLES));
+        const tables = "'" + tableNames.join("', '") + "'";
+        // console.log("logs to check synced tables1", JSON.stringify(tables));
+        const currentTimestamp = new Date();
+        const reducedTimestamp = new Date(currentTimestamp); // clone it
+        reducedTimestamp.setMinutes(reducedTimestamp.getMinutes() - 1);
+        const formattedTimestamp = reducedTimestamp.toISOString();
+        this.executeQuery(
+          `UPDATE pull_sync_info SET last_pulled = '${formattedTimestamp}'  WHERE table_name IN (${tables})`,
+        );
+        return res;
+      }
+    } finally {
+      this._syncInProgress = false;
+      if (this._syncRequestedAgain) {
+        console.log(
+          "🔁 Running sync again because changes happened during sync",
+        );
+        this._syncRequestedAgain = false;
+
+        setTimeout(() => {
+          this.syncDbNow();
+        }, 0);
+      }
     }
     // console.log("logs to check synced tables2", JSON.stringify(tables));
   }
@@ -2361,7 +2432,6 @@ export class SqliteApi implements ServiceApi {
     user_id?: string | undefined,
     status?: RESULT_STATUS | null,
   ): Promise<TableTypes<"result">> {
-
     let resultId = uuidv4();
     let isDuplicate = true;
     while (isDuplicate) {
@@ -2481,28 +2551,28 @@ export class SqliteApi implements ServiceApi {
 
     let starsEarned = 0;
     if (isAssessment) {
-    const assessmentKey = `assessment_star_state_${student.id}_${lessonId}`;
-    const awarded = sessionStorage.getItem(assessmentKey) === "true";
-    if (!awarded) {
-      starsEarned = 3;
-      sessionStorage.setItem(assessmentKey, "true");
-    }
+      const assessmentKey = `assessment_star_state_${student.id}_${lessonId}`;
+      const awarded = sessionStorage.getItem(assessmentKey) === "true";
+      if (!awarded) {
+        starsEarned = 3;
+        sessionStorage.setItem(assessmentKey, "true");
+      }
     } else {
       if (score > 25) starsEarned++;
       if (score > 50) starsEarned++;
       if (score > 75) starsEarned++;
     }
 
-      if (starsEarned > 0) {
-        const latestStarsKey = LATEST_STARS(student.id);
-        const currentLocalStars = parseInt(
-          localStorage.getItem(latestStarsKey) || "0"
-        );
-        localStorage.setItem(
-          latestStarsKey,
-          (currentLocalStars + starsEarned).toString(),
-        );
-      }
+    if (starsEarned > 0) {
+      const latestStarsKey = LATEST_STARS(student.id);
+      const currentLocalStars = parseInt(
+        localStorage.getItem(latestStarsKey) || "0",
+      );
+      localStorage.setItem(
+        latestStarsKey,
+        (currentLocalStars + starsEarned).toString(),
+      );
+    }
     let query = `UPDATE ${TABLES.User} SET `;
     let params: any[] = [];
 
@@ -2513,13 +2583,12 @@ export class SqliteApi implements ServiceApi {
     // Fetch fresh value only for star calculation
     const latestUserForStars = await this.getUserByDocId(student.id);
     const totalStars = (latestUserForStars?.stars || 0) + starsEarned;
-      const latestLocalStarsForStudent = parseInt(
-        localStorage.getItem(LATEST_STARS(student.id)) || "0"
-      );
+    const latestLocalStarsForStudent = parseInt(
+      localStorage.getItem(LATEST_STARS(student.id)) || "0",
+    );
     const finalStarsToSet = Math.max(totalStars, latestLocalStarsForStudent);
     query += `stars =  ? WHERE id = ?;`;
     params.push(finalStarsToSet, student.id);
-
 
     await this.executeQuery(query, params);
 
@@ -2754,7 +2823,6 @@ export class SqliteApi implements ServiceApi {
       language_id = ?,
       locale_id = ?,
       updated_at = ?
-      ${languageChanged ? ", learning_path = ?" : ""}
     WHERE id = ?;
   `;
     const params = [
@@ -2769,10 +2837,6 @@ export class SqliteApi implements ServiceApi {
       localeId,
       now,
     ];
-    // Clear learning_path when language changes so it gets rebuilt with lessons in the new language
-    if (languageChanged) {
-      params.push(null);
-    }
     params.push(student.id);
     await this.executeQuery(updateUserQuery, params);
 
@@ -2786,9 +2850,6 @@ export class SqliteApi implements ServiceApi {
     student.language_id = languageDocId;
     student.locale_id = localeId;
     student.updated_at = now;
-    if (languageChanged) {
-      localStorage.setItem(LANG_REFRESHED, "true");
-    }
 
     await this.assignCoursesToStudent(
       student.id,
@@ -2841,7 +2902,6 @@ export class SqliteApi implements ServiceApi {
     student_id: string,
     newClassId: string,
   ): Promise<TableTypes<"user">> {
-
     const languageChanged = student.language_id !== languageDocId;
     let localeId = student.locale_id;
 
@@ -2942,7 +3002,7 @@ export class SqliteApi implements ServiceApi {
       if (currentClassId !== newClassId) {
         // Update class_user table to set previous record as deleted
         const currentClassUserId = `
-          SELECT id FROM class_user 
+          SELECT id FROM class_user
           WHERE user_id = ? AND class_id = ? AND is_deleted = 0
         `;
 
@@ -4061,6 +4121,24 @@ export class SqliteApi implements ServiceApi {
     if (!res || !res.values || res.values.length < 1) return;
     return res.values[0];
   }
+  async getAssignmentsByIds(
+    ids: string[],
+  ): Promise<TableTypes<"assignment">[]> {
+    if (!ids.length) return [];
+
+    const idslst = ids.map(() => "?").join(", ");
+    const query = `
+      SELECT *
+      FROM ${TABLES.Assignment}
+      WHERE id IN (${idslst})
+        AND is_deleted = 0;
+    `;
+
+    const res = await this._db?.query(query, ids);
+    if (!res?.values?.length) return [];
+
+    return res.values as TableTypes<"assignment">[];
+  }
 
   async getBadgesByIds(ids: string[]): Promise<TableTypes<"badge">[]> {
     if (ids.length === 0) return [];
@@ -4338,40 +4416,13 @@ export class SqliteApi implements ServiceApi {
     userId: string,
     lessons: string,
   ): Promise<boolean | undefined> {
-    await this.executeQuery(
-      `
-      INSERT INTO assignment_cart (
-          id,
-          lessons,
-          updated_at
-      ) VALUES (?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-          lessons = excluded.lessons,
-          updated_at = excluded.updated_at;
-      `,
-      [userId, lessons, new Date().toISOString()],
-    );
-    await this._serverApi.pushAssignmentCart(
-      {
-        id: userId,
-        lessons: lessons,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        is_deleted: false,
-      },
-      userId,
-    );
-    // await this.updatePushChanges(
-    //   TABLES.Assignment_cart,
-    //   MUTATE_TYPES.UPDATE,
-    //   {
-    //     id: userId,
-    //     lessons: lessons,
-    //     created_at: new Date().toISOString(),
-    //     updated_at: new Date().toISOString(),
-    //     is_deleted: false,
-    //   }
-    // )
+    const now = new Date().toISOString();
+    const existing = readAssignmentCartFromStorage(userId);
+    writeAssignmentCartToStorage(userId, {
+      lessons,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    });
     return true;
   }
 
@@ -4537,12 +4588,9 @@ export class SqliteApi implements ServiceApi {
   }
   async getUserAssignmentCart(
     userId: string,
-  ): Promise<TableTypes<"assignment_cart"> | undefined> {
-    const res = await this._db?.query(
-      `select * from ${TABLES.Assignment_cart} where id = "${userId}"`,
-    );
-    if (!res || !res.values || res.values.length < 1) return;
-    return res.values[0];
+  ): Promise<AssignmentCartData | undefined> {
+    const cart = readAssignmentCartFromStorage(userId);
+    return cart;
   }
   async getStudentProgress(studentId: string): Promise<Map<string, string>> {
     const query = `
@@ -5115,6 +5163,7 @@ order by
            ROW_NUMBER() OVER (PARTITION BY course_id ORDER BY created_at DESC) AS rn
     FROM ${TABLES.Assignment}
     WHERE class_id = '${classId}'
+      AND is_deleted = 0
     )
     SELECT *
     FROM RankedAssignments
@@ -5467,6 +5516,39 @@ order by
 
     if (!res || !res.values || res.values.length < 1) return;
     return res.values;
+  }
+
+  async getUniqueAssignmentIdsByCourseAndChapter(
+    classId: string,
+    courseId: string,
+    chapterIdOrIds: string | string[],
+  ): Promise<string[]> {
+    const chapterIds = Array.isArray(chapterIdOrIds)
+      ? chapterIdOrIds.filter(Boolean)
+      : [chapterIdOrIds].filter(Boolean);
+
+    if (!chapterIds.length) return [];
+
+    const idslst = chapterIds.map(() => "?").join(", ");
+    const query = `
+      SELECT DISTINCT id
+      FROM ${TABLES.Assignment}
+      WHERE class_id = ?
+        AND course_id = ?
+        AND chapter_id IN (${idslst})
+        AND is_deleted = 0; 
+    `;
+
+    const res = await this._db?.query(query, [
+      classId,
+      courseId,
+      ...chapterIds,
+    ]);
+    if (!res?.values?.length) return [];
+
+    return res.values
+      .map((row: any) => row.id as string | undefined)
+      .filter((id): id is string => Boolean(id));
   }
 
   async getSchoolsWithRoleAutouser(
@@ -5960,19 +6042,19 @@ order by
     starsCount: number,
     is_immediate_sync?: boolean,
   ): Promise<void> {
-      if (!studentId) return;
-      try {
-        const be = await this.getUserByDocId(studentId);
-        const latestStarsKey = LATEST_STARS(studentId);
-        const currentLocalStars = parseInt(
-          localStorage.getItem(latestStarsKey) || "0",
-          10,
-        );
+    if (!studentId) return;
+    try {
+      const be = await this.getUserByDocId(studentId);
+      const latestStarsKey = LATEST_STARS(studentId);
+      const currentLocalStars = parseInt(
+        localStorage.getItem(latestStarsKey) || "0",
+        10,
+      );
 
-        const nextLocalStars = currentLocalStars + starsCount;
-        console.log("zuzu 2", { studentId, stars: nextLocalStars });
+      const nextLocalStars = currentLocalStars + starsCount;
+      console.log("zuzu 2", { studentId, stars: nextLocalStars });
 
-        localStorage.setItem(latestStarsKey, nextLocalStars.toString());
+      localStorage.setItem(latestStarsKey, nextLocalStars.toString());
 
       await this.executeQuery(
         `UPDATE ${TABLES.User} SET stars = COALESCE(stars, 0) + ? WHERE id = ?;`,
@@ -6016,7 +6098,7 @@ order by
       const updateUserQuery = `UPDATE ${TABLES.User}
       SET learning_path = ?, updated_at = ?
       WHERE id = ?;`;
-      await this.executeQuery(updateUserQuery, [learningPath, now , student.id]);
+      await this.executeQuery(updateUserQuery, [learningPath, now, student.id]);
       student.learning_path = learningPath;
       this.updatePushChanges(
         TABLES.User,
@@ -6026,6 +6108,15 @@ order by
           learning_path: learningPath,
         },
         is_immediate_sync,
+      );
+      const latestPathToSave = {
+        studentId: student.id,
+        learningPath,
+        updated_at: new Date(Date.now() + 10000).toISOString(),
+      };
+      sessionStorage.setItem(
+        LATEST_LEARNING_PATH,
+        JSON.stringify(latestPathToSave),
       );
     } catch (error) {
       console.error("Error updating learning path:", error);
@@ -6757,10 +6848,10 @@ order by
   }
 
   async mergeStudentRequest(
-    requestId: string,
     existingStudentId: string,
     newStudentId: string,
-    respondedBy: string,
+    requestId?: string | undefined,
+    respondedBy?: string | undefined,
   ): Promise<void> {
     if (!this._db) {
       throw new Error("SQLite DB not initialized.");
@@ -7165,33 +7256,66 @@ order by
     searchTerm: string,
     page: number,
     limit: number,
+    classId?: string,
   ): Promise<{ data: any[]; total: number }> {
     if (!this._db) return { data: [], total: 0 };
-    // Build query for multi-field search
-    let whereClause = `cu.role = 'student' AND cu.is_deleted = 0 AND c.school_id = ?`;
+    let whereClause = `
+    cu.role = 'student'
+    AND cu.is_deleted = 0
+    AND c.school_id = ?
+  `;
     let params: any[] = [schoolId];
+    // ✅ ADD CLASS FILTER ONLY IF classId EXISTS
+    if (classId) {
+      whereClause += ` AND cu.class_id = ?`;
+      params.push(classId);
+    }
+    // ✅ SEARCH FILTER
     if (searchTerm && searchTerm.trim() !== "") {
-      whereClause += ` AND (u.name LIKE ? OR u.student_id LIKE ? OR u.phone LIKE ?)`;
+      whereClause += `
+      AND (
+        u.name LIKE ?
+        OR u.student_id LIKE ?
+        OR u.phone LIKE ?
+      )
+    `;
       const likeTerm = `%${searchTerm}%`;
       params.push(likeTerm, likeTerm, likeTerm);
     }
     const offset = (page - 1) * limit;
-    // Get total count
-    const countQuery = `SELECT COUNT(*) as total FROM class_user cu JOIN user u ON cu.user_id = u.id JOIN class c ON cu.class_id = c.id WHERE ${whereClause}`;
+    // ✅ COUNT QUERY
+    const countQuery = `
+    SELECT COUNT(*) as total
+    FROM class_user cu
+    JOIN user u ON cu.user_id = u.id
+    JOIN class c ON cu.class_id = c.id
+    WHERE ${whereClause}
+  `;
     const countResult = await this._db.query(countQuery, params);
     const total = countResult?.values?.[0]?.total ?? 0;
-    // Get paginated data
+    // ✅ DATA QUERY
     const query = `
-      SELECT u.id, u.name, u.student_id, u.phone, cu.class_id, c.name as class_name, pu.parent_id, p.name as parent_name
-      FROM class_user cu
-      JOIN user u ON cu.user_id = u.id
-      JOIN class c ON cu.class_id = c.id
-      LEFT JOIN parent_user pu ON pu.student_id = u.id AND pu.is_deleted = 0
-      LEFT JOIN user p ON pu.parent_id = p.id
-      WHERE ${whereClause}
-      ORDER BY u.name
-      LIMIT ? OFFSET ?
-    `;
+    SELECT 
+      u.id,
+      u.name,
+      u.student_id,
+      u.phone,
+      cu.class_id,
+      c.name as class_name,
+      pu.parent_id,
+      p.name as parent_name
+    FROM class_user cu
+    JOIN user u ON cu.user_id = u.id
+    JOIN class c ON cu.class_id = c.id
+    LEFT JOIN parent_user pu 
+      ON pu.student_id = u.id 
+      AND pu.is_deleted = 0
+    LEFT JOIN user p 
+      ON pu.parent_id = p.id
+    WHERE ${whereClause}
+    ORDER BY u.name
+    LIMIT ? OFFSET ?
+  `;
     const result = await this._db.query(query, [...params, limit, offset]);
     return { data: result?.values ?? [], total };
   }
@@ -7801,8 +7925,10 @@ order by
   async getSubjectLessonsBySubjectId(
     subjectId: string,
     student?: TableTypes<"user">,
-  ): Promise<TableTypes<"subject_lesson">[]> {
-    const langId = student?.language_id ?? null;
+  ): Promise<TableTypes<"subject_lesson">> {
+    if (!student) return {} as TableTypes<"subject_lesson">;
+    const studentId = student.id;
+    const langId = student.language_id ?? null;
 
     try {
       // 1️⃣ Fetch ALL available set_numbers
@@ -7817,67 +7943,93 @@ order by
       const setRows = (setRes as any)?.values ?? [];
 
       if (!setRows.length) {
-        return [];
+        return {} as TableTypes<"subject_lesson">;
       }
 
       // 2️⃣ Pick ANY ONE set randomly
       const randomIndex = Math.floor(Math.random() * setRows.length);
       const setNumber = setRows[randomIndex].set_number;
 
-      // 3️⃣ Fetch lessons (LANGUAGE ONLY)
+      /* ==========================================
+       * 3️⃣ Abort Check (with assignment_id IS NULL)
+       * ========================================== */
+      const abortQuery = `
+        SELECT lesson_id, status
+        FROM (
+            SELECT lesson_id, status, created_at,
+                  ROW_NUMBER() OVER (
+                      PARTITION BY lesson_id
+                      ORDER BY created_at DESC
+                  ) as rn
+            FROM result
+            WHERE student_id = ?
+              AND subject_id = ?
+              AND assignment_id IS NULL
+              AND is_deleted = 0
+        ) t
+        WHERE rn = 1
+        ORDER BY created_at DESC
+        LIMIT 2;
+      `;
+
+      const abortRes = await this.executeQuery(abortQuery, [
+        studentId,
+        subjectId,
+      ]);
+
+      const lastTwo = (abortRes as any)?.values ?? [];
+
+      const isAborted =
+        lastTwo.length === 2 &&
+        lastTwo.every((r: any) => r.status === "system_exit");
+
+      if (isAborted) {
+        return {} as TableTypes<"subject_lesson">; // 🚫 Aborted group
+      }
+
+      /* ==========================================
+       * 4️⃣ Fetch ONLY pending lessons from set
+       * ========================================== */
       const lessonQuery = `
-  SELECT sl.*
-  FROM subject_lesson sl
-  WHERE sl.subject_id = ?
-    AND sl.set_number = ?
-    AND sl.is_deleted = 0
-    AND (
-      sl.language_id = ?
-      OR sl.language_id IS NULL
-    )
-  ORDER BY
-    CASE
-      WHEN sl.language_id = ? THEN 0
-      WHEN sl.language_id IS NULL THEN 1
-    END,
-    sl.sort_index ASC;
-`;
+        SELECT sl.*
+        FROM subject_lesson sl
+        LEFT JOIN result r
+          ON r.lesson_id = sl.lesson_id
+          AND r.student_id = ?
+          AND r.assignment_id IS NULL
+          AND r.is_deleted = 0
+
+        WHERE sl.subject_id = ?
+          AND sl.set_number = ?
+          AND sl.is_deleted = 0
+          AND (
+            sl.language_id = ?
+            OR sl.language_id IS NULL
+          )
+          AND r.lesson_id IS NULL
+
+        ORDER BY
+          sl.set_number ASC,
+          sl.sort_index ASC;
+      `;
 
       const lessonRes = await this.executeQuery(lessonQuery, [
+        studentId,
         subjectId,
         setNumber,
         langId,
       ]);
 
-      const lessons = (lessonRes as any)?.values ?? [];
-      if (!lessons.length) return [];
-
-      /* =====================================================
-       * 4️⃣ JS SORTING (ONLY IF > 5) — LANGUAGE ONLY
-       * ===================================================== */
-      if (lessons.length > 5) {
-        lessons.sort((a: any, b: any) => {
-          const getPriority = (x: any): number => {
-            if (x.language_id === langId) return 1;
-            if (x.language_id === null) return 2;
-            return 3;
-          };
-
-          const pA = getPriority(a);
-          const pB = getPriority(b);
-
-          if (pA !== pB) return pA - pB;
-          return (a.sort_index ?? 0) - (b.sort_index ?? 0);
-        });
-      }
-
-      return lessons;
+      const pendingLessons = (lessonRes as any)?.values ?? [];
+      return pendingLessons.length
+        ? pendingLessons[0]
+        : ({} as TableTypes<"subject_lesson">);
     } catch (error) {
       console.error(
         "❌ Error fetching subject lessons by subject (SQL):",
         error,
       );
-      return [];
+      return {} as TableTypes<"subject_lesson">;
     }
   }
 
@@ -7887,37 +8039,42 @@ order by
   ): Promise<boolean> {
     try {
       const query = `
-      SELECT 1
-      FROM result
-      WHERE student_id = ?
-        AND course_id = ?
-        AND is_deleted = false
+        SELECT 1
+        FROM result r
+        INNER JOIN lesson l
+          ON l.id = r.lesson_id
+          AND l.is_deleted = false
+        WHERE r.student_id = ?
+          AND r.course_id = ?
+          AND r.is_deleted = false
 
-        -- 🔒 STRICT: all required columns must be present
-        AND skill_id IS NOT NULL
-        AND outcome_id IS NOT NULL
-        AND competency_id IS NOT NULL
-        AND domain_id IS NOT NULL
-        AND subject_id IS NOT NULL
+          -- ❗ Only PAL lessons (exclude assessments)
+          AND l.plugin_type != 'lido_assessment'
 
-        AND skill_ability IS NOT NULL
-        AND outcome_ability IS NOT NULL
-        AND competency_ability IS NOT NULL
-        AND domain_ability IS NOT NULL
-        AND subject_ability IS NOT NULL
+          -- 🔒 STRICT ability validation
+          AND r.skill_id IS NOT NULL
+          AND r.outcome_id IS NOT NULL
+          AND r.competency_id IS NOT NULL
+          AND r.domain_id IS NOT NULL
+          AND r.subject_id IS NOT NULL
 
-        AND activities_scores IS NOT NULL
-        AND activities_scores <> ''
-      LIMIT 1;
-    `;
+          AND r.skill_ability IS NOT NULL
+          AND r.outcome_ability IS NOT NULL
+          AND r.competency_ability IS NOT NULL
+          AND r.domain_ability IS NOT NULL
+          AND r.subject_ability IS NOT NULL
+
+          AND r.activities_scores IS NOT NULL
+          AND r.activities_scores <> ''
+        LIMIT 1;
+      `;
 
       const res = await this.executeQuery(query, [studentId, courseId]);
       const rows = (res as any)?.values ?? [];
 
-      // ✅ true ONLY if a fully-filled result exists
       return rows.length > 0;
     } catch (error) {
-      console.error("❌ Error checking course history:", error);
+      console.error("❌ Error checking PAL lesson history:", error);
       return false;
     }
   }
@@ -7947,22 +8104,115 @@ order by
   async getLatestAssessmentGroup(
     classId: string,
     student: TableTypes<"user">,
+    courseId?: string,
   ): Promise<TableTypes<"assignment">[]> {
     const nowIso = new Date().toISOString();
+    const studentId = student.id;
     const langId = student.language_id;
 
-    /* ===============================
-     * QUERY 1️⃣ : Fetch valid assessments
-     * =============================== */
-    const fetchQuery = `
-      SELECT a.*
+    /* ==========================================
+     * Get latest valid assessment batch
+     * ========================================== */
+    const latestBatchQuery = `
+      SELECT a.batch_id
       FROM assignment a
-      JOIN course c
-        ON c.id = a.course_id
-      AND c.is_deleted = false
+      LEFT JOIN assignment_user au
+        ON a.id = au.assignment_id
+        AND au.is_deleted = false
       WHERE a.class_id = '${classId}'
+        AND a.course_id = '${courseId}'
         AND a.type = 'assessment'
         AND a.is_deleted = false
+        AND a.batch_id IS NOT NULL
+
+        -- Active time window
+        AND (
+          a.starts_at IS NULL
+          OR a.starts_at = ''
+          OR datetime(a.starts_at) <= datetime('${nowIso}')
+        )
+        AND (
+          a.ends_at IS NULL
+          OR a.ends_at = ''
+          OR datetime(a.ends_at) > datetime('${nowIso}')
+        )
+
+        -- Assigned to this student
+        AND (
+          a.is_class_wise = true
+          OR au.user_id = '${studentId}'
+        )
+
+      ORDER BY a.created_at DESC
+      LIMIT 1;
+    `;
+
+    const batchRes = await this._db?.query(latestBatchQuery);
+    const latestBatchId = batchRes?.values?.[0]?.batch_id;
+
+    if (!latestBatchId) return [];
+
+    /* ==========================================
+     * Check if batch is ABORTED
+     * (2 consecutive system_exit results)
+     * ========================================== */
+    const abortCheckQuery = `
+    SELECT assignment_id, status
+    FROM (
+        SELECT r.assignment_id,
+              r.status,
+              r.created_at,
+              ROW_NUMBER() OVER (
+                  PARTITION BY r.assignment_id
+                  ORDER BY r.created_at DESC
+              ) as rn
+        FROM result r
+        INNER JOIN assignment a
+            ON a.id = r.assignment_id
+        WHERE r.student_id = '${studentId}'
+          AND r.is_deleted = false
+          AND a.batch_id = '${latestBatchId}'
+          AND a.course_id = '${courseId}'
+          AND a.type = 'assessment'
+    ) t
+    WHERE rn = 1
+    ORDER BY created_at DESC
+    LIMIT 2;
+    `;
+
+    const abortRes = await this._db?.query(abortCheckQuery);
+    const lastTwoResults = abortRes?.values ?? [];
+
+    if (
+      lastTwoResults.length === 2 &&
+      lastTwoResults.every((r: any) => r.status === "system_exit")
+    ) {
+      // 🚫 Assessment group is aborted
+      return [];
+    }
+
+    /* ==========================================
+     * Get only INCOMPLETE assignments
+     * from that latest batch
+     * ========================================== */
+    const assignmentsQuery = `
+      SELECT a.*
+      FROM assignment a
+
+      LEFT JOIN assignment_user au
+        ON a.id = au.assignment_id
+        AND au.is_deleted = false
+
+      LEFT JOIN result r
+        ON r.assignment_id = a.id
+        AND r.student_id = '${studentId}'
+        AND r.is_deleted = false
+
+      WHERE a.class_id = '${classId}'
+        AND a.course_id = '${courseId}'
+        AND a.type = 'assessment'
+        AND a.is_deleted = false
+        AND a.batch_id = '${latestBatchId}'
 
         -- time window
         AND (
@@ -7976,18 +8226,14 @@ order by
           OR datetime(a.ends_at) > datetime('${nowIso}')
         )
 
-        -- latest batch per course
-        AND a.batch_id = (
-          SELECT a2.batch_id
-          FROM assignment a2
-          WHERE a2.class_id = a.class_id
-            AND a2.course_id = a.course_id
-            AND a2.type = 'assessment'
-            AND a2.is_deleted = false
-            AND a2.batch_id IS NOT NULL
-          ORDER BY a2.created_at DESC
-          LIMIT 1
+        -- Assigned to this student
+        AND (
+          a.is_class_wise = true
+          OR au.user_id = '${studentId}'
         )
+
+        -- NOT completed
+        AND r.assignment_id IS NULL
 
         -- subject_lesson validation (LANGUAGE ONLY)
         AND EXISTS (
@@ -7998,88 +8244,26 @@ order by
             AND sl.is_deleted = false
             AND (
               sl.language_id IS NULL
-              OR sl.language_id = "${langId}"
+              OR sl.language_id = '${langId}'
             )
         )
-      ORDER BY a.course_id, a.created_at DESC;
+
+      ORDER BY (
+        SELECT sl.sort_index
+        FROM subject_lesson sl
+        WHERE sl.lesson_id = a.lesson_id
+          AND sl.set_number = a.set_number
+          AND sl.is_deleted = false
+        LIMIT 1
+      ) ASC,
+      a.created_at DESC;
     `;
-    const fetchRes = await this._db?.query(fetchQuery);
-    const assignments = (fetchRes?.values ?? []) as TableTypes<"assignment">[];
-    if (!assignments.length) return [];
-    /* ===============================
-     * QUERY 2️⃣ : Completion check (PER COURSE)
-     * =============================== */
-    const assignmentIds = assignments.map((a) => `'${a.id}'`).join(",");
-    const completionQuery = `
-      WITH r AS (
-        SELECT
-          a.course_id,
-          a.id,
-          r.id AS result_id,
-          r.status,
-          LAG(r.status) OVER (
-            PARTITION BY a.course_id
-            ORDER BY a.created_at
-          ) AS prev_status
-        FROM assignment a
-        LEFT JOIN result r
-          ON r.assignment_id = a.id
-        AND r.student_id = "${student.id}"
-        AND r.is_deleted = false
-        WHERE a.id IN (${assignmentIds})
-      )
 
-      SELECT
-        course_id,
-        CASE
-          -- 1️⃣ all assignments of this course attempted
-          WHEN COUNT(result_id) = COUNT(*) THEN 0
+    const res = await this._db?.query(assignmentsQuery);
+    const pendingAssignments = (res?.values ??
+      []) as TableTypes<"assignment">[];
 
-          -- 2️⃣ some attempted + 2 continuous system_exit (this course)
-          WHEN COUNT(result_id) > 0
-          AND COUNT(*) FILTER (
-            WHERE status = 'system_exit'
-              AND prev_status = 'system_exit'
-          ) > 0 THEN 0
-
-          -- 3️⃣ otherwise → pending exists
-          ELSE COUNT(*) - COUNT(result_id)
-        END AS pending_count
-      FROM r
-      GROUP BY course_id;
-    `;
-    const completionRes = await this._db?.query(completionQuery);
-    const rows = completionRes?.values ?? [];
-    console.log("Completion rows:", rows);
-    // courses that should be hidden
-    const blockedCourseIds = new Set(
-      rows
-        .filter((r: any) => r.pending_count === 0)
-        .map((r: any) => r.course_id),
-    );
-    const finalAssignments = assignments.filter(
-      (a) => a.course_id && !blockedCourseIds.has(a.course_id),
-    );
-    if (!finalAssignments.length) return [];
-    if (finalAssignments.length > 5) {
-      finalAssignments.sort((a, b) => {
-        const getPriority = (x: any): number => {
-          if (x.language_id === langId) return 1;
-          if (x.language_id === null) return 2;
-          return 3;
-        };
-
-        const pA = getPriority(a);
-        const pB = getPriority(b);
-
-        if (pA !== pB) return pA - pB;
-
-        return (
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-        );
-      });
-    }
-    return finalAssignments;
+    return pendingAssignments.length ? pendingAssignments : [];
   }
   async getWhatsappGroupDetails(groupId: string, bot: string) {
     return this._serverApi.getWhatsappGroupDetails(groupId, bot);
@@ -8110,5 +8294,89 @@ order by
     members: number;
   } | null> {
     throw new Error("Method not implemented.");
+  }
+
+  async getAssignmentInfoForLessonsPerClass(
+    classId: string,
+    lessonIds: string[],
+  ): Promise<string[]> {
+    if (!lessonIds?.length) return [];
+
+    const placeholders = lessonIds.map(() => "?").join(", ");
+
+    const query = `
+    SELECT DISTINCT lesson_id
+    FROM ${TABLES.Assignment}
+    WHERE class_id = ?
+      AND lesson_id IN (${placeholders})
+      AND is_deleted = 0;
+  `;
+
+    const res = await this._db?.query(query, [classId, ...lessonIds]);
+
+    if (!res?.values?.length) return [];
+
+    return res.values
+      .map((row: any) => row.lesson_id as string | undefined)
+      .filter((id): id is string => Boolean(id));
+  }
+
+  // ================================
+  // STICKER BOOK (Server Delegation)
+  // ================================
+
+  async getAllStickerBooks(): Promise<StickerBook[]> {
+    return await this._serverApi.getAllStickerBooks();
+  }
+
+  async getCurrentStickerBookWithProgress(userId: string): Promise<{
+    book: StickerBook;
+    progress: UserStickerProgress | null;
+  } | null> {
+    return await this._serverApi.getCurrentStickerBookWithProgress(userId);
+  }
+
+  async getUserWonStickerBooks(userId: string): Promise<StickerBook[]> {
+    return await this._serverApi.getUserWonStickerBooks(userId);
+  }
+
+  async getNextWinnableSticker(stickerBookId: string): Promise<string | null> {
+    return await this._serverApi.getNextWinnableSticker(stickerBookId);
+  }
+
+  async updateStickerWon(
+    stickerBookId: string,
+    stickerId: string,
+  ): Promise<void> {
+    return await this._serverApi.updateStickerWon(stickerBookId, stickerId);
+  }
+  async isAssignmentAlreadyAssigned(
+    schoolId: string,
+    classId: string,
+    courseId: string,
+    chapterId: string,
+    lessonId: string,
+  ): Promise<boolean> {
+    try {
+      const res = await this._db?.query(
+        `
+      SELECT id
+      FROM ${TABLES.Assignment}
+      WHERE school_id = ?
+        AND class_id = ?
+        AND course_id = ?
+        AND chapter_id = ?
+        AND lesson_id = ?
+        AND is_deleted = 0
+      LIMIT 1
+      `,
+        [schoolId, classId, courseId, chapterId, lessonId],
+      );
+
+      return !!(res?.values && res.values.length > 0);
+    } catch (error) {
+      console.error("Error checking existing assignment:", error);
+      return false;
+    }
   }
 }

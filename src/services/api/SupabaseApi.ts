@@ -62,7 +62,7 @@ import Course from "../../models/course";
 import Lesson from "../../models/lesson";
 import LiveQuizRoomObject from "../../models/liveQuizRoom";
 import User from "../../models/user";
-import { LeaderboardInfo, ServiceApi } from "./ServiceApi";
+import { AssignmentCartData, LeaderboardInfo, ServiceApi } from "./ServiceApi";
 import { Database } from "../database";
 import {
   PostgrestSingleResponse,
@@ -70,11 +70,19 @@ import {
   SupabaseClient,
   createClient,
 } from "@supabase/supabase-js";
-import { RoleType } from "../../interface/modelInterfaces";
+import {
+  RoleType,
+  StickerBook,
+  UserStickerProgress,
+} from "../../interface/modelInterfaces";
 import { Util } from "../../utility/util";
 import { v4 as uuidv4 } from "uuid";
 import { ServiceConfig } from "../ServiceConfig";
 import { SqliteApi } from "./SqliteApi";
+import {
+  readAssignmentCartFromStorage,
+  writeAssignmentCartToStorage,
+} from "../../teachers-module/pages/AssignmentCartStorage";
 import {
   UserSchoolClassParams,
   UserSchoolClassResult,
@@ -86,6 +94,7 @@ export class SupabaseApi implements ServiceApi {
   private _assignmentUserRealTime?: RealtimeChannel;
   private _liveQuizRealTime?: RealtimeChannel;
   private _currentMode: MODES;
+  private searchStudentsTimer: any = null;
   async getChaptersForCourse(courseId: string): Promise<
     {
       course_id: string | null;
@@ -469,7 +478,7 @@ export class SupabaseApi implements ServiceApi {
                   "🔄 [Fallback] Realtime update:",
                   status,
                   "ID:",
-                  id
+                  id,
                 );
                 if (
                   (status === "success" || status === "failed") &&
@@ -478,11 +487,11 @@ export class SupabaseApi implements ServiceApi {
                   resolved = true;
                   await fallbackChannel?.unsubscribe();
                   console.log(
-                    `✅ / ❌ Fallback resolved with status: ${status}`
+                    `✅ / ❌ Fallback resolved with status: ${status}`,
                   );
                   resolve(status === "success");
                 }
-              }
+              },
             )
             .subscribe()
         : null;
@@ -906,8 +915,13 @@ export class SupabaseApi implements ServiceApi {
   }
 
   async pushAssignmentCart(data: { [key: string]: any }, id: string) {
-    if (!this.supabase) return;
-    await this.supabase.from(TABLES.Assignment_cart).upsert({ id, ...data });
+    const now = new Date().toISOString();
+    const existing = readAssignmentCartFromStorage(id);
+    writeAssignmentCartToStorage(id, {
+      lessons: data?.lessons ?? existing?.lessons ?? null,
+      created_at: existing?.created_at ?? data?.created_at ?? now,
+      updated_at: data?.updated_at ?? now,
+    });
   }
 
   async updateSchoolLocation(
@@ -2362,7 +2376,7 @@ export class SupabaseApi implements ServiceApi {
     subject_ability?: number | undefined,
     activities_scores?: string | null,
     user_id?: string | null,
-    status?: RESULT_STATUS | null
+    status?: RESULT_STATUS | null,
   ): Promise<TableTypes<"result">> {
     if (!this.supabase) return {} as TableTypes<"result">;
 
@@ -2399,7 +2413,7 @@ export class SupabaseApi implements ServiceApi {
       subject_ability: subject_ability ?? null,
       activities_scores: activities_scores ?? null,
       user_id: user_id ?? null,
-      status:status ?? null,
+      status: status ?? null,
     };
 
     const { error: insertError } = await this.supabase
@@ -3476,6 +3490,7 @@ export class SupabaseApi implements ServiceApi {
     schoolId: string,
     page: number = 1,
     limit: number = 20,
+    classId?: string,
   ): Promise<StudentAPIResponse> {
     if (!this.supabase) {
       console.warn("Supabase not initialized.");
@@ -3493,23 +3508,23 @@ export class SupabaseApi implements ServiceApi {
         class_name:name
       ),
       user:user_id!inner (
-          age,
-          avatar,
-          created_at,
-          curriculum_id,
-          fcm_token,
-          firebase_id,
+        age,
+        avatar,
+        created_at,
+        curriculum_id,
+        fcm_token,
+        firebase_id,
         grade_id,
-      image,
-      is_deleted,
-      is_firebase,
-      is_ops,
-     language_id,
-     is_tc_accepted,
-     student_id,
-     reward,
-     updated_at,
-      learning_path,
+        image,
+        is_deleted,
+        is_firebase,
+        is_ops,
+        language_id,
+        is_tc_accepted,
+        student_id,
+        reward,
+        updated_at,
+        learning_path,
         id,
         name,
         phone,
@@ -3532,6 +3547,9 @@ export class SupabaseApi implements ServiceApi {
       .eq("is_deleted", false)
       .eq("class.school_id", schoolId);
 
+    if (classId) {
+      query = query.eq("class_id", classId);
+    }
     const { data, error, count } = await query
       .order("user(name)", { ascending: true })
       .range(offset, offset + limit - 1);
@@ -3543,14 +3561,16 @@ export class SupabaseApi implements ServiceApi {
 
     const studentInfoList: StudentInfo[] = (data || []).map((row: any) => {
       const { user, class: cls } = row;
-
       const className = cls?.class_name || "";
       const { grade, section } = this.parseClassName(className);
-
       const parent = user?.parent_links?.[0]?.parent || null;
-
+      const updatedUser = {
+        ...user,
+        phone: user?.phone || parent?.phone || "",
+        email: user?.email || parent?.email || "",
+      };
       return {
-        user,
+        user: updatedUser,
         grade,
         classSection: section,
         parent,
@@ -3690,40 +3710,36 @@ export class SupabaseApi implements ServiceApi {
   }
 
   async mergeStudentRequest(
-    requestId: string, //request row Id
-    existingStudentId: string,
+    existingStudentId: string, // OLD student (to delete)
     newStudentId: string,
-    respondedBy: string,
+    requestId?: string | undefined, // NEW student (to keep)
+    respondedBy?: string | undefined,
   ): Promise<void> {
     if (!this.supabase) {
       throw new Error("Supabase not initialized.");
     }
     const now = new Date().toISOString();
-
-    // 1. Get new student details (including parents)
+    // 1. Get NEW student (kept student)
     const { data: newStudentData, error: newStudentError } = await this.supabase
       .from("user")
       .select(
         `
-      *,
-      parent_links:parent_user!student_id (
-        parent:parent_id (*)
-      )
-    `,
+        *,
+        parent_links:parent_user!student_id (
+          parent:parent_id (*)
+        )
+      `,
       )
       .eq("id", newStudentId)
       .eq("is_deleted", false)
       .single();
-
     if (newStudentError || !newStudentData) {
       throw new Error("New student not found");
     }
-
     const newParents = (newStudentData.parent_links || []).map(
       (link: any) => link.parent,
     );
-
-    // 2. Get existing student details (with parents)
+    // 2. Get OLD student (to merge & delete)
     const { data: existingStudentData, error: existingStudentError } =
       await this.supabase
         .from("user")
@@ -3738,86 +3754,106 @@ export class SupabaseApi implements ServiceApi {
         .eq("id", existingStudentId)
         .eq("is_deleted", false)
         .single();
-
+    console.log(
+      "Existing student data:",
+      existingStudentData,
+      "Error:",
+      existingStudentError,
+    );
     if (existingStudentError || !existingStudentData) {
       throw new Error("Existing student not found");
     }
-
     const existingParents = (existingStudentData.parent_links || []).map(
       (link: any) => link.parent,
     );
-
-    // 3. Compare phone or email
-    const existingContact =
-      existingParents?.[0]?.phone || existingParents?.[0]?.email || null;
-    const newContact = newParents?.[0]?.phone || newParents?.[0]?.email || null;
-
-    // 4. Transfer results if present
+    // 3. Transfer results OLD → NEW
     const { data: results } = await this.supabase
       .from("result")
       .select("*")
-      .eq("student_id", newStudentId)
+      .eq("student_id", existingStudentId)
       .eq("is_deleted", false);
 
     if (results && results.length > 0) {
       await this.supabase
         .from("result")
-        .update({ student_id: existingStudentId, updated_at: now })
-        .eq("student_id", newStudentId)
+        .update({
+          student_id: newStudentId,
+          updated_at: now,
+        })
+        .eq("student_id", existingStudentId)
         .eq("is_deleted", false);
     }
+    // 4. Merge parents (phone-phone, email-email, phone-email supported)
+    const allParents = [...existingParents, ...newParents];
+    const uniqueParents: any[] = [];
+    for (const parent of allParents) {
+      const alreadyExists = uniqueParents.some((p) => {
+        const phoneMatch = p.phone && parent.phone && p.phone === parent.phone;
 
-    // 5. If contact different, link new parent(s)
-    if (newContact && newContact !== existingContact) {
-      for (const parent of newParents) {
-        const alreadyLinked = existingParents.some(
-          (p: any) =>
-            (p.phone && parent.phone && p.phone === parent.phone) ||
-            (p.email && parent.email && p.email === parent.email),
-        );
+        const emailMatch = p.email && parent.email && p.email === parent.email;
 
-        if (!alreadyLinked) {
-          await this.supabase.from("parent_user").insert({
-            student_id: existingStudentId,
-            parent_id: parent.id,
-            is_deleted: false,
-            updated_at: now,
-          });
-        }
+        return phoneMatch || emailMatch;
+      });
+
+      if (!alreadyExists) {
+        uniqueParents.push(parent);
       }
     }
+    // Link all unique parents to NEW student
+    for (const parent of uniqueParents) {
+      // 1️⃣ Check if relation exists
+      const { data: existingLink } = await this.supabase
+        .from("parent_user")
+        .select("id")
+        .eq("student_id", newStudentId)
+        .eq("parent_id", parent.id)
+        .maybeSingle();
 
-    // 6. Mark new student and related records as deleted
+      // 2️⃣ If not exists → insert
+      if (!existingLink) {
+        await this.supabase.from("parent_user").insert({
+          student_id: newStudentId,
+          parent_id: parent.id,
+          is_deleted: false,
+          updated_at: now,
+        });
+      } else {
+        console.log("Already linked — skipping");
+      }
+    }
+    // 5. Soft delete OLD student relations
     await this.supabase
       .from("class_user")
       .update({ is_deleted: true, updated_at: now })
-      .eq("user_id", newStudentId);
+      .eq("user_id", existingStudentId);
 
     await this.supabase
       .from("parent_user")
       .update({ is_deleted: true, updated_at: now })
-      .eq("student_id", newStudentId);
+      .eq("student_id", existingStudentId);
 
     await this.supabase
       .from("user")
       .update({ is_deleted: true, updated_at: now })
-      .eq("id", newStudentId);
+      .eq("id", existingStudentId);
 
-    const { error: updateRequestError } = await this.supabase
-      .from("ops_requests")
-      .update({
-        request_status: "approved",
-        updated_at: now,
-        responded_by: respondedBy,
-      })
-      .eq("id", requestId); // Identify the specific request
-
-    if (updateRequestError) {
-      console.error(
-        "Error updating ops_requests status:",
-        updateRequestError.message,
-      );
-      throw new Error("Failed to update request status.");
+    // 6. Update ops request status
+    if (requestId && respondedBy) {
+      const { error: updateRequestError } = await this.supabase
+        .from("ops_requests")
+        .update({
+          request_status: "approved",
+          updated_at: now,
+          responded_by: respondedBy,
+        })
+        .eq("request_id", requestId);
+      if (updateRequestError) {
+        console.error(
+          "Error updating ops_requests status:",
+          updateRequestError.message,
+        );
+        throw new Error("Failed to update request status.");
+      }
     }
   }
 
@@ -4699,27 +4735,35 @@ export class SupabaseApi implements ServiceApi {
 
     return data ?? undefined;
   }
+  async getAssignmentsByIds(
+    ids: string[],
+  ): Promise<TableTypes<"assignment">[]> {
+    if (!this.supabase || ids.length === 0) return [];
+
+    const { data, error } = await this.supabase
+      .from("assignment")
+      .select("*")
+      .in("id", ids)
+      .eq("is_deleted", false);
+
+    if (error) {
+      console.error("Error fetching assignments by ids:", error);
+      return [];
+    }
+
+    return (data ?? []) as TableTypes<"assignment">[];
+  }
   async createOrUpdateAssignmentCart(
     userId: string,
     lessons: string,
   ): Promise<boolean | undefined> {
-    if (!this.supabase) return undefined;
-
     const now = new Date().toISOString();
-
-    const { error } = await this.supabase.from("assignment_cart").upsert(
-      {
-        id: userId,
-        lessons,
-        updated_at: now,
-      },
-      { onConflict: "id" },
-    );
-
-    if (error) {
-      console.error("Error creating/updating assignment cart:", error);
-      return false;
-    }
+    const existing = readAssignmentCartFromStorage(userId);
+    writeAssignmentCartToStorage(userId, {
+      lessons,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    });
 
     return true;
   }
@@ -5268,19 +5312,9 @@ export class SupabaseApi implements ServiceApi {
 
   async getUserAssignmentCart(
     userId: string,
-  ): Promise<TableTypes<"assignment_cart"> | undefined> {
-    if (!this.supabase) return;
-
-    const { data, error } = await this.supabase
-      .from("assignment_cart")
-      .select("*")
-      .eq("id", userId)
-      .eq("is_deleted", false)
-      .single();
-
-    if (error || !data) return;
-
-    return data;
+  ): Promise<AssignmentCartData | undefined> {
+    const cart = readAssignmentCartFromStorage(userId);
+    return cart;
   }
 
   async getChapterByLesson(
@@ -6064,6 +6098,51 @@ export class SupabaseApi implements ServiceApi {
     } catch (err) {
       console.error("Error in getResultByChapterByDate:", err);
       return;
+    }
+  }
+
+  async getUniqueAssignmentIdsByCourseAndChapter(
+    classId: string,
+    courseId: string,
+    chapterIdOrIds: string | string[],
+  ): Promise<string[]> {
+    if (!this.supabase) return [];
+
+    try {
+      const chapterIds = Array.isArray(chapterIdOrIds)
+        ? chapterIdOrIds.filter(Boolean)
+        : [chapterIdOrIds].filter(Boolean);
+
+      if (!chapterIds.length) return [];
+
+      let query = this.supabase
+        .from(TABLES.Assignment)
+        .select("id")
+        .eq("class_id", classId)
+        .eq("course_id", courseId)
+        .eq("is_deleted", false);
+
+      query =
+        chapterIds.length === 1
+          ? query.eq("chapter_id", chapterIds[0])
+          : query.in("chapter_id", chapterIds);
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error(
+          "Supabase error in getUniqueAssignmentIdsByCourseAndChapter:",
+          error,
+        );
+        return [];
+      }
+
+      return Array.from(
+        new Set((data ?? []).map((row: any) => row.id).filter(Boolean)),
+      ) as string[];
+    } catch (err) {
+      console.error("Error in getUniqueAssignmentIdsByCourseAndChapter:", err);
+      return [];
     }
   }
 
@@ -7626,7 +7705,7 @@ export class SupabaseApi implements ServiceApi {
           const val = data[key];
           parsed[key] = Array.isArray(val)
             ? val.filter(
-                (v) => typeof v === "string" && v.trim() !== "" && v !== "null"
+                (v) => typeof v === "string" && v.trim() !== "" && v !== "null",
               )
             : [];
         }
@@ -8785,109 +8864,231 @@ export class SupabaseApi implements ServiceApi {
       throw error;
     }
   }
-
   async searchStudentsInSchool(
     schoolId: string,
     searchTerm: string,
     page: number,
     limit: number,
+    classId?: string,
   ): Promise<{ data: any[]; total: number }> {
-    if (!this.supabase) return { data: [], total: 0 };
-    try {
-      // Step 1: Get all class_ids for the school
-      const { data: classData, error: classError } = await this.supabase
-        .from("class")
-        .select("id, name")
-        .eq("school_id", schoolId)
-        .eq("is_deleted", false);
-      if (classError || !classData) {
-        console.error("Error fetching classes for school:", classError);
-        return { data: [], total: 0 };
-      }
-      const classIds = classData.map((row: any) => row.id);
-      if (classIds.length === 0) return { data: [], total: 0 };
-      // Step 2: Get all class_user rows for those classes and role student, filter by name using ilike
-      const { data: classUserData, error: classUserError } = await this.supabase
-        .from("class_user")
-        .select(`user:user_id (*), class_id`)
-        .in("class_id", classIds)
-        .eq("role", "student")
-        .eq("is_deleted", false)
-        .ilike("user.name", `%${searchTerm}%`)
-        .not("user", "is", null);
-      if (classUserError || !classUserData) {
-        console.error("Error fetching class_user rows:", classUserError);
-        return { data: [], total: 0 };
-      }
-      // Step 3: Get parent phone numbers for each student using an inner query
-      const studentIds = classUserData.map((row: any) => row.user.id);
-      let parentPhoneMap: Record<
-        string,
-        {
-          parent_id: string;
-          parent_name: string | null;
-          parent_phone: string | null;
-        }
-      > = {};
-      if (studentIds.length > 0) {
-        const { data: parentData, error: parentError } = await this.supabase
-          .from("parent_user")
-          .select("student_id, parent_id, user:parent_id(id, name, phone)")
-          .in("student_id", studentIds)
-          .eq("is_deleted", false);
-        if (parentError) {
-          console.error("Error fetching parent_user rows:", parentError);
-        } else {
-          for (const row of parentData ?? []) {
-            let parent_name = null;
-            let parent_phone = null;
-            if (
-              row.user &&
-              typeof row.user === "object" &&
-              !Array.isArray(row.user)
-            ) {
-              parent_name = (row.user as any).name ?? null;
-              parent_phone = (row.user as any).phone ?? null;
-            }
-            parentPhoneMap[row.student_id] = {
-              parent_id: row.parent_id,
-              parent_name,
-              parent_phone,
-            };
-          }
-        }
-      }
-      // Step 4: Pagination
-      const offset = (page - 1) * limit;
-      const pagedRows = classUserData.slice(offset, offset + limit);
-      // Step 5: Build result objects
-      const result = pagedRows.map((row: any) => {
-        const classInfo = classData.find((c: any) => c.id === row.class_id);
-        const className = classInfo?.name ?? "";
-        const { grade, section } = this.parseClassName(className);
-        const parentInfo = parentPhoneMap[row.user.id] ?? {};
-        return {
-          id: row.user.id,
-          name: row.user.name,
-          gender: row.user.gender ?? null,
-          student_id: row.user.student_id,
-          phone: row.user.phone,
-          class_id: row.class_id,
-          class_name: className,
-          grade,
-          classSection: section,
-          parent: {
-            id: parentInfo.parent_id ?? undefined,
-            name: parentInfo.parent_name ?? undefined,
-            phone: parentInfo.parent_phone ?? undefined,
-          },
-        };
-      });
-      return { data: result, total: classUserData.length };
-    } catch (err) {
-      console.error("Error searching students in school:", err);
+    if (!this.supabase) {
       return { data: [], total: 0 };
     }
+
+    const supabase = this.supabase;
+
+    return new Promise((resolve) => {
+      if (this.searchStudentsTimer) {
+        clearTimeout(this.searchStudentsTimer);
+      }
+
+      this.searchStudentsTimer = setTimeout(async () => {
+        try {
+          let classQuery = supabase
+            .from("class")
+            .select("id, name")
+            .eq("school_id", schoolId)
+            .eq("is_deleted", false);
+
+          if (classId) {
+            classQuery = classQuery.eq("id", classId);
+          }
+
+          const { data: classData } = await classQuery;
+
+          const classIds = (classData ?? []).map((c: any) => c.id);
+
+          if (classIds.length === 0) {
+            resolve({ data: [], total: 0 });
+            return;
+          }
+
+          const studentFilter = `name.ilike.%${searchTerm}%,student_id.ilike.%${searchTerm}%`;
+
+          // ✅ ADDED phone IN SELECT
+          const { data: studentRows } = await supabase
+            .from("class_user")
+            .select(
+              `
+              class_id,
+              user:user_id!inner (
+                id,
+                name,
+                email,
+                phone,
+                gender,
+                student_id
+              )
+            `,
+            )
+            .in("class_id", classIds)
+            .eq("role", "student")
+            .eq("is_deleted", false)
+            .or(studentFilter, {
+              foreignTable: "user",
+            });
+
+          const parentFilter = `phone.ilike.%${searchTerm}%,email.ilike.%${searchTerm}%`;
+
+          const { data: parentRows } = await supabase
+            .from("class_user")
+            .select(
+              `
+              user:user_id!inner (
+                id,
+                phone,
+                email
+              )
+            `,
+            )
+            .in("class_id", classIds)
+            .eq("role", "parent")
+            .eq("is_deleted", false)
+            .or(parentFilter, {
+              foreignTable: "user",
+            });
+          const parentIds = (parentRows ?? []).map((p: any) => p.user.id);
+
+          let parentLinkedStudents: any[] = [];
+
+          const parentContactMap = new Map<string, any>();
+
+          if (parentIds.length > 0) {
+            const { data: parentLinks } = await supabase
+              .from("parent_user")
+              .select(
+                `
+                student_id,
+                parent:parent_id (
+                  phone,
+                  email
+                )
+              `,
+              )
+              .in("parent_id", parentIds)
+              .eq("is_deleted", false);
+
+            const studentIds = (parentLinks ?? []).map(
+              (l: any) => l.student_id,
+            );
+
+            (parentLinks ?? []).forEach((link: any) => {
+              parentContactMap.set(link.student_id, {
+                phone: link.parent?.phone ?? null,
+                email: link.parent?.email ?? null,
+              });
+            });
+
+            if (studentIds.length > 0) {
+              const { data } = await supabase
+                .from("class_user")
+                .select(
+                  `
+                  class_id,
+                  user:user_id!inner (
+                    id,
+                    name,
+                    email,
+                    phone,
+                    gender,
+                    student_id
+                  )
+                `,
+                )
+                .in("class_id", classIds)
+                .eq("role", "student")
+                .in("user_id", studentIds)
+                .eq("is_deleted", false);
+
+              parentLinkedStudents = data ?? [];
+            }
+          }
+
+          const allRows = [...(studentRows ?? []), ...parentLinkedStudents];
+
+          const uniqueMap = new Map<string, any>();
+
+          allRows.forEach((row) => {
+            uniqueMap.set(row.user.id, row);
+          });
+
+          const mergedRows = Array.from(uniqueMap.values());
+          // ✅ GET ALL STUDENT IDS
+          const allStudentIds = mergedRows.map((r: any) => r.user.id);
+
+          // ✅ FETCH THEIR PARENTS
+          if (allStudentIds.length > 0) {
+            const { data: allParentLinks } = await supabase
+              .from("parent_user")
+              .select(
+                `
+        student_id,
+        parent:parent_id (
+          phone,
+          email
+        )
+      `,
+              )
+              .in("student_id", allStudentIds)
+              .eq("is_deleted", false);
+
+            (allParentLinks ?? []).forEach((link: any) => {
+              parentContactMap.set(link.student_id, {
+                phone: link.parent?.phone ?? null,
+                email: link.parent?.email ?? null,
+              });
+            });
+          }
+          const offset = (page - 1) * limit;
+
+          const pagedRows = mergedRows.slice(offset, offset + limit);
+          const result = pagedRows.map((row: any) => {
+            const classInfo = classData?.find(
+              (c: any) => c.id === row.class_id,
+            );
+
+            const className = classInfo?.name ?? "";
+
+            const { grade, section } = this.parseClassName(className);
+
+            const parentContact = parentContactMap.get(row.user.id) ?? {};
+
+            // ✅ FALLBACK FLATTEN LOGIC (ONLY ADDITION)
+            const phone = row.user.phone || parentContact.phone || "";
+
+            const email = row.user.email || parentContact.email || "";
+            return {
+              user: {
+                id: row.user.id,
+                name: row.user.name,
+                student_id: row.user.student_id,
+                gender: row.user.gender,
+                phone,
+                email,
+              },
+
+              parent: {
+                phone: parentContact.phone ?? null,
+                email: parentContact.email ?? null,
+              },
+
+              class_id: row.class_id,
+              class_name: className,
+              grade,
+              classSection: section,
+            };
+          });
+
+          resolve({
+            data: result,
+            total: mergedRows.length,
+          });
+        } catch (err) {
+          console.error(err);
+          resolve({ data: [], total: 0 });
+        }
+      }, 400);
+    });
   }
   async searchTeachersInSchool(
     schoolId: string,
@@ -10799,14 +11000,16 @@ export class SupabaseApi implements ServiceApi {
   async getSubjectLessonsBySubjectId(
     subjectId: string,
     student?: TableTypes<"user">,
-  ): Promise<TableTypes<"subject_lesson">[]> {
-    const langId = student?.language_id ?? null;
-    const localeId = student?.locale_id ?? null;
-    if (!this.supabase) return [];
+  ): Promise<TableTypes<"subject_lesson">> {
+    if (!this.supabase || !student) return {} as TableTypes<"subject_lesson">;
+
+    const studentId = student.id;
+    const langId = student.language_id ?? null;
+
     try {
-      /* =====================================================
+      /* ==========================================
        * 1️⃣ Fetch ALL available set_numbers
-       * ===================================================== */
+       * ========================================== */
       const { data: setRows, error: setError } = await this.supabase
         .from("subject_lesson")
         .select("set_number")
@@ -10815,10 +11018,9 @@ export class SupabaseApi implements ServiceApi {
         .not("set_number", "is", null);
 
       if (setError) throw setError;
-      if (!setRows?.length) return [];
+      if (!setRows?.length) return {} as TableTypes<"subject_lesson">;
 
-      // ✅ ensure number[] (NO nulls)
-      const uniqueSets: number[] = Array.from(
+      const uniqueSets = Array.from(
         new Set(
           setRows
             .map((r) => r.set_number)
@@ -10826,77 +11028,108 @@ export class SupabaseApi implements ServiceApi {
         ),
       );
 
-      if (!uniqueSets.length) return [];
+      if (!uniqueSets.length) return {} as TableTypes<"subject_lesson">;
 
       const randomIndex = Math.floor(Math.random() * uniqueSets.length);
-      const setNumber = uniqueSets[randomIndex]; // ✅ number
+      const setNumber = uniqueSets[randomIndex];
 
-      /* =====================================================
-       * 2️⃣ Build OR conditions safely
-       * ===================================================== */
-      const orConditions: string[] = [
-        "and(language_id.is.null,locale_id.is.null)",
-      ];
+      /* ==========================================
+       * 2️⃣ Abort Check (assignment_id IS NULL)
+       * ========================================== */
+      const { data, error } = await this.supabase
+        .from("result")
+        .select("lesson_id, status, created_at")
+        .eq("student_id", studentId)
+        .eq("subject_id", subjectId)
+        .is("assignment_id", null)
+        .eq("is_deleted", false)
+        .order("created_at", { ascending: false })
+        .limit(50);
 
-      if (langId !== null) {
-        orConditions.push(`and(language_id.eq.${langId},locale_id.is.null)`);
+      if (error) {
+        console.error("Abort query error:", error);
+        return {} as TableTypes<"subject_lesson">;
       }
 
-      if (localeId !== null) {
-        orConditions.push(`and(language_id.is.null,locale_id.eq.${localeId})`);
+      if (!data || data.length === 0) {
+        return {} as TableTypes<"subject_lesson">;
       }
 
-      if (langId !== null && localeId !== null) {
-        orConditions.push(
-          `and(language_id.eq.${langId},locale_id.eq.${localeId})`,
-        );
+      /* -----------------------------------------
+        Keep latest result per unique lesson
+      ------------------------------------------ */
+      const uniqueMap = new Map<string, any>();
+
+      for (const row of data) {
+        if (!row.lesson_id) continue;
+        if (!uniqueMap.has(row.lesson_id)) {
+          uniqueMap.set(row.lesson_id, row);
+        }
+
+        // Stop early when we get 2 unique lessons
+        if (uniqueMap.size === 2) break;
       }
 
-      /* =====================================================
-       * 3️⃣ Fetch lessons
-       * ===================================================== */
+      const lastTwoUniqueLessons = Array.from(uniqueMap.values());
+
+      /* -----------------------------------------
+        Abort check
+      ------------------------------------------ */
+      const isAborted =
+        lastTwoUniqueLessons.length === 2 &&
+        lastTwoUniqueLessons.every((r) => r.status === "system_exit");
+
+      if (isAborted) {
+        return {} as TableTypes<"subject_lesson">; // 🚫 Aborted group
+      }
+
+      /* ==========================================
+       * 3️⃣ Fetch lessons from selected set
+       * ========================================== */
       const { data: lessons, error: lessonError } = await this.supabase
         .from("subject_lesson")
         .select("*")
         .eq("subject_id", subjectId)
-        .eq("set_number", setNumber) // ✅ FIXED
+        .eq("set_number", setNumber)
         .eq("is_deleted", false)
-        .or(orConditions.join(","));
+        .or(`language_id.eq.${langId},language_id.is.null`)
+        .order("set_number", { ascending: true })
+        .order("sort_index", { ascending: true });
 
-      if (lessonError) throw lessonError;
-      if (!lessons?.length) return [];
+      if (lessonError || !lessons?.length)
+        return {} as TableTypes<"subject_lesson">;
 
-      /* =====================================================
-       * 4️⃣ JS SORTING
-       * ===================================================== */
-      if (lessons.length > 5) {
-        lessons.sort((a: any, b: any) => {
-          const getPriority = (x: any): number => {
-            const l = x.language_id ?? null;
-            const lo = x.locale_id ?? null;
+      /* ==========================================
+       * 4️⃣ Remove completed lessons
+       * (assignment_id IS NULL only)
+       * ========================================== */
+      const lessonIds = lessons.map((l) => l.lesson_id);
 
-            if (l === langId && lo === localeId) return 1;
-            if (l === langId && lo === null) return 2;
-            if (l === null && lo === localeId) return 3;
-            if (l === null && lo === null) return 4;
-            return 5;
-          };
+      const { data: results } = await this.supabase
+        .from("result")
+        .select("lesson_id")
+        .in("lesson_id", lessonIds)
+        .eq("student_id", studentId)
+        .is("assignment_id", null)
+        .eq("is_deleted", false);
 
-          const pA = getPriority(a);
-          const pB = getPriority(b);
+      const completedLessonIds = new Set(
+        (results ?? []).map((r) => r.lesson_id),
+      );
 
-          if (pA !== pB) return pA - pB;
-          return (a.sort_index ?? 0) - (b.sort_index ?? 0);
-        });
-      }
+      const pendingLessons = lessons.filter(
+        (l) => !completedLessonIds.has(l.lesson_id),
+      );
 
-      return lessons;
+      return pendingLessons.length
+        ? (pendingLessons[0] as TableTypes<"subject_lesson">)
+        : ({} as TableTypes<"subject_lesson">);
     } catch (error) {
       console.error(
         "❌ Error fetching subject lessons by subject (Supabase):",
         error,
       );
-      return [];
+      return {} as TableTypes<"subject_lesson">;
     }
   }
 
@@ -10935,10 +11168,25 @@ export class SupabaseApi implements ServiceApi {
 
       const { data, error } = await this.supabase
         .from("result")
-        .select("id")
+        .select(
+          `
+          id,
+          lesson!inner(
+            id,
+            plugin_type,
+            is_deleted
+          )
+        `,
+        )
         .eq("student_id", studentId)
         .eq("course_id", courseId)
         .eq("is_deleted", false)
+
+        // 🔒 join condition parity
+        .eq("lesson.is_deleted", false)
+        .neq("lesson.plugin_type", "lido_assessment")
+
+        // STRICT ability validation
         .not("skill_id", "is", null)
         .not("outcome_id", "is", null)
         .not("competency_id", "is", null)
@@ -10961,10 +11209,9 @@ export class SupabaseApi implements ServiceApi {
         return false;
       }
 
-      // ✅ true ONLY if a fully-filled result exists
       return Array.isArray(data) && data.length > 0;
     } catch (error) {
-      console.error("❌ Error checking played PLA lesson:", error);
+      console.error("❌ Error checking PAL lesson history:", error);
       return false;
     }
   }
@@ -10986,132 +11233,174 @@ export class SupabaseApi implements ServiceApi {
 
     return true;
   }
-async getLatestAssessmentGroup(
-  classId: string,
-  student: TableTypes<"user">
-): Promise<TableTypes<"assignment">[]> {
-  if (!this.supabase) return [];
-  const nowIso = new Date().toISOString();
-  const langId = student.language_id;
-  const localeId = student.locale_id;
-  const { data: assignments, error } = await this.supabase
-    .from(TABLES.Assignment)
-    .select(
-      `
-        *,
-        course!inner(id, is_deleted)
-      `
-    )
-    .eq("class_id", classId)
-    .eq("type", "assessment")
-    .eq("is_deleted", false)
-    .eq("course.is_deleted", false)
-    .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
-    .or(`ends_at.is.null,ends_at.gt.${nowIso}`);
+  async getLatestAssessmentGroup(
+    classId: string,
+    student: TableTypes<"user">,
+    courseId?: string,
+  ): Promise<TableTypes<"assignment">[]> {
+    if (!this.supabase) return [];
 
-  if (error || !assignments?.length) return [];
-  const latestBatchByCourse = new Map<string, string>();
-  for (const a of assignments) {
-    if (!a.course_id || !a.batch_id) continue;
-    if (!latestBatchByCourse.has(a.course_id)) {
-      latestBatchByCourse.set(a.course_id, a.batch_id);
-    }
-  }
-  const batchFiltered = assignments.filter(
-    (a) =>
-      a.course_id &&
-      a.batch_id &&
-      latestBatchByCourse.get(a.course_id) === a.batch_id
-  );
-  if (!batchFiltered.length) return [];
-  const assignmentIds = batchFiltered.map((a) => a.id);
-  const { data: results } = await this.supabase
-    .from(TABLES.Result)
-    .select(
-      `
+    const nowIso = new Date().toISOString();
+    const studentId = student.id;
+    const langId = student.language_id;
+
+    courseId = courseId ?? "";
+
+    /* ==========================================
+     * STEP 1️⃣  Get latest valid batch for course
+     * ========================================== */
+    const { data: latestBatchData, error: batchError } = await this.supabase
+      .from(TABLES.Assignment)
+      .select("batch_id, created_at")
+      .eq("class_id", classId)
+      .eq("course_id", courseId)
+      .eq("type", "assessment")
+      .eq("is_deleted", false)
+      .not("batch_id", "is", null)
+      .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
+      .or(`ends_at.is.null,ends_at.gt.${nowIso}`)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (batchError || !latestBatchData?.length) return [];
+
+    const latestBatchId = latestBatchData[0].batch_id;
+    if (!latestBatchId) return [];
+
+    /* ==========================================
+     * STEP 2️⃣  Abort check (2 system_exit)
+     * ========================================== */
+    const { data, error: abortError } = await this.supabase
+      .from(TABLES.Result)
+      .select(
+        `
         assignment_id,
         status,
-        assignment!inner(course_id, created_at)
-      `
-    )
-    .in("assignment_id", assignmentIds)
-    .eq("student_id", student.id)
-    .eq("is_deleted", false);
-  const courseMap = new Map<
-    string,
-    { assignments: any[]; results: any[] }
-  >();
-  for (const a of batchFiltered) {
-    if (!a.course_id) continue;
-    if (!courseMap.has(a.course_id)) {
-      courseMap.set(a.course_id, { assignments: [], results: [] });
+        created_at,
+        assignment!inner(batch_id, course_id, type)
+      `,
+      )
+      .eq("student_id", studentId)
+      .eq("is_deleted", false)
+      .eq("assignment.batch_id", latestBatchId)
+      .eq("assignment.course_id", courseId)
+      .eq("assignment.type", "assessment")
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (abortError) {
+      console.error("Abort query error:", abortError);
+      return [];
     }
-    courseMap.get(a.course_id)!.assignments.push(a);
-  }
-  (results ?? []).forEach((r: any) => {
-    const courseId = r.assignment?.course_id;
-    if (!courseId || !courseMap.has(courseId)) return;
-    courseMap.get(courseId)!.results.push(r);
-  });
-  const blockedCourseIds = new Set<string>();
-  courseMap.forEach(({ assignments, results }, courseId) => {
-    if (results.length === assignments.length) {
-      blockedCourseIds.add(courseId);
-      return;
+
+    if (!data || data.length === 0) {
+      return [];
     }
-    const ordered = assignments
-      .map((a) => {
-        const res = results.find((r) => r.assignment_id === a.id);
-        return {
-          created_at: a.created_at,
-          status: res?.status ?? null,
-        };
-      })
-      .sort(
-        (a, b) =>
-          new Date(a.created_at).getTime() -
-          new Date(b.created_at).getTime()
+
+    /* -----------------------------------------
+      Keep latest result per unique assignment
+    ------------------------------------------ */
+    const uniqueMap = new Map<string, any>();
+
+    for (const row of data) {
+      if (!row.assignment_id) continue;
+
+      if (!uniqueMap.has(row.assignment_id)) {
+        uniqueMap.set(row.assignment_id, row);
+      }
+
+      // stop early once we have 2 unique assignments
+      if (uniqueMap.size === 2) break;
+    }
+
+    const lastTwoUniqueAssignments = Array.from(uniqueMap.values());
+
+    /* -----------------------------------------
+      Abort check
+    ------------------------------------------ */
+    const isAborted =
+      lastTwoUniqueAssignments.length === 2 &&
+      lastTwoUniqueAssignments.every((r) => r.status === "system_exit");
+
+    if (isAborted) {
+      return [];
+    }
+
+    /* ==========================================
+     * STEP 3️⃣  Get incomplete assignments
+     * ========================================== */
+    const { data: assignments, error: lessonError } = await this.supabase
+      .from(TABLES.Assignment)
+      .select("*")
+      .eq("class_id", classId)
+      .eq("course_id", courseId)
+      .eq("type", "assessment")
+      .eq("is_deleted", false)
+      .eq("batch_id", latestBatchId)
+      .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
+      .or(`ends_at.is.null,ends_at.gt.${nowIso}`);
+
+    if (lessonError || !assignments?.length) return [];
+
+    const assignmentIds = assignments.map((a) => a.id);
+
+    // fetch completed results
+    const { data: results } = await this.supabase
+      .from(TABLES.Result)
+      .select("assignment_id")
+      .in("assignment_id", assignmentIds)
+      .eq("student_id", studentId)
+      .eq("is_deleted", false);
+
+    const completedSet = new Set((results ?? []).map((r) => r.assignment_id));
+
+    const incompleteAssignments = assignments.filter(
+      (a) => !completedSet.has(a.id),
+    );
+
+    if (!incompleteAssignments.length) return [];
+
+    /* ==========================================
+     * STEP 4️⃣  subject_lesson validation
+     * (lesson_id + set_number + language)
+     * ========================================== */
+    const lessonIds = incompleteAssignments.map((a) => a.lesson_id);
+
+    const { data: subjectLessons } = await this.supabase
+      .from(TABLES.SubjectLesson)
+      .select("lesson_id, set_number, language_id, sort_index")
+      .in("lesson_id", lessonIds)
+      .eq("is_deleted", false);
+
+    if (!subjectLessons?.length) return [];
+
+    const validAssignments = incompleteAssignments.filter((a) =>
+      subjectLessons.some(
+        (sl) =>
+          sl.lesson_id === a.lesson_id &&
+          sl.set_number === a.set_number &&
+          (!sl.language_id || sl.language_id === langId),
+      ),
+    );
+
+    if (!validAssignments.length) return [];
+
+    /* ==========================================
+     * STEP 5️⃣  Sort by subject_lesson.sort_index
+     * ========================================== */
+    validAssignments.sort((a, b) => {
+      const slA = subjectLessons.find(
+        (sl) => sl.lesson_id === a.lesson_id && sl.set_number === a.set_number,
+      );
+      const slB = subjectLessons.find(
+        (sl) => sl.lesson_id === b.lesson_id && sl.set_number === b.set_number,
       );
 
-    for (let i = 1; i < ordered.length; i++) {
-      if (
-        ordered[i].status === "system_exit" &&
-        ordered[i - 1].status === "system_exit"
-      ) {
-        blockedCourseIds.add(courseId);
-        return;
-      }
-    }
-  });
-  const courseFiltered = batchFiltered.filter(
-    (a) => a.course_id && !blockedCourseIds.has(a.course_id)
-  );
-  if (!courseFiltered.length) return [];
-  const lessonIds = [
-    ...new Set(courseFiltered.map((a) => a.lesson_id).filter(Boolean)),
-  ];
-  let subjectLessonQuery = this.supabase
-    .from(TABLES.SubjectLesson)
-    .select("lesson_id")
-    .in("lesson_id", lessonIds)
-    .eq("is_deleted", false);
-  const orConditions: string[] = ["language_id.is.null,locale_id.is.null"];
-  if (langId) orConditions.push(`language_id.eq.${langId},locale_id.is.null`);
-  if (localeId)
-    orConditions.push(`language_id.is.null,locale_id.eq.${localeId}`);
-  if (langId && localeId)
-    orConditions.push(`language_id.eq.${langId},locale_id.eq.${localeId}`);
-  subjectLessonQuery = subjectLessonQuery.or(orConditions.join("|"));
-  const { data: subjectLessons } = await subjectLessonQuery;
-  if (!subjectLessons?.length) return [];
-  const validLessonIds = new Set(
-    subjectLessons.map((sl) => sl.lesson_id)
-  );
-  const finalAssignments = courseFiltered.filter(
-    (a) => a.lesson_id && validLessonIds.has(a.lesson_id)
-  );
-  return finalAssignments as TableTypes<"assignment">[];
-}
+      return (slA?.sort_index ?? 0) - (slB?.sort_index ?? 0);
+    });
+
+    return validAssignments as TableTypes<"assignment">[];
+  }
   async getWhatsappGroupDetails(groupId: string, bot: string) {
     if (!this.supabase) return [];
     const { data, error } = await this.supabase.functions.invoke(
@@ -11226,5 +11515,253 @@ async getLatestAssessmentGroup(
     }
 
     return data;
+  }
+  async getAssignmentInfoForLessonsPerClass(
+    classId: string,
+    lessonIds: string[],
+  ): Promise<string[]> {
+    if (!this.supabase) return [];
+
+    try {
+      if (!lessonIds?.length) return [];
+
+      const { data, error } = await this.supabase
+        .from(TABLES.Assignment)
+        .select("lesson_id")
+        .eq("class_id", classId)
+        .eq("is_deleted", false)
+        .in("lesson_id", lessonIds);
+
+      if (error) {
+        console.error(
+          "Supabase error in getAssignmentInfoForLessonsPerClass:",
+          error,
+        );
+        return [];
+      }
+
+      return Array.from(
+        new Set((data ?? []).map((row: any) => row.lesson_id).filter(Boolean)),
+      ) as string[];
+    } catch (err) {
+      console.error("Error in getAssignmentInfoForLessonsPerClass:", err);
+      return [];
+    }
+  }
+
+  async getAllStickerBooks(): Promise<StickerBook[]> {
+    if (!this.supabase) return [];
+
+    const { data, error } = await this.supabase
+      .from("sticker_book")
+      .select("*")
+      .eq("is_deleted", false)
+      .order("sort_index", { ascending: true });
+
+    if (error) throw error;
+    return data ?? [];
+  }
+
+  async getCurrentStickerBookWithProgress(userId: string): Promise<{
+    book: StickerBook;
+    progress: UserStickerProgress | null;
+  } | null> {
+    if (!this.supabase) return null;
+
+    // 1️⃣ Try existing in_progress row
+    const { data: progress } = await this.supabase
+      .from("user_sticker_book")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("status", "in_progress")
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    // 2️⃣ If user already has active progress
+    if (progress) {
+      const { data: book } = await this.supabase
+        .from("sticker_book")
+        .select("*")
+        .eq("id", progress.sticker_book_id)
+        .eq("is_deleted", false)
+        .single();
+
+      if (!book) return null;
+
+      return {
+        book: book as StickerBook,
+        progress: progress as UserStickerProgress,
+      };
+    }
+
+    // 3️⃣ Fallback → first sticker book
+    const { data: firstBook } = await this.supabase
+      .from("sticker_book")
+      .select("*")
+      .eq("is_deleted", false)
+      .order("sort_index", { ascending: true })
+      .limit(1)
+      .single();
+
+    if (!firstBook) return null;
+
+    return {
+      book: firstBook as StickerBook,
+      progress: null,
+    };
+  }
+
+  async getUserWonStickerBooks(userId: string): Promise<StickerBook[]> {
+    if (!this.supabase) return [];
+
+    const { data, error } = await this.supabase
+      .from("user_sticker_book")
+      .select(
+        `
+      *,
+      sticker_book (*)
+    `,
+      )
+      .eq("user_id", userId)
+      .eq("status", "completed")
+      .eq("is_deleted", false)
+      .eq("sticker_book.is_deleted", false);
+
+    if (error) {
+      console.error("getUserWonStickerBooks error:", error);
+      return [];
+    }
+
+    return data?.map((r: any) => r.sticker_book as StickerBook) ?? [];
+  }
+
+  async getNextWinnableSticker(stickerBookId: string): Promise<string | null> {
+    if (!this.supabase) return null;
+
+    const user = await ServiceConfig.getI().authHandler.getCurrentUser();
+    if (!user?.id) return null;
+
+    const userId = user.id;
+
+    const { data: book } = await this.supabase
+      .from("sticker_book")
+      .select("*")
+      .eq("id", stickerBookId)
+      .eq("is_deleted", false)
+      .single();
+
+    if (!book) return null;
+
+    const { data: progress } = await this.supabase
+      .from("user_sticker_book")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("sticker_book_id", stickerBookId)
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    const collected = progress?.stickers_collected ?? [];
+
+    const sorted = [...book.stickers_metadata].sort(
+      (a: any, b: any) => a.sequence - b.sequence,
+    );
+
+    const next = sorted.find((s: any) => !collected.includes(s.id));
+
+    return next?.id ?? null;
+  }
+
+  async updateStickerWon(
+    stickerBookId: string,
+    stickerId: string,
+  ): Promise<void> {
+    const user = await ServiceConfig.getI().authHandler.getCurrentUser();
+
+    if (!user?.id) return;
+    if (!this.supabase) return;
+
+    const userId = user.id;
+
+    // get book
+    const { data: book } = await this.supabase
+      .from("sticker_book")
+      .select("*")
+      .eq("id", stickerBookId)
+      .eq("is_deleted", false)
+      .single();
+
+    if (!book) return;
+
+    const total = book.total_stickers;
+
+    const { data: progress } = await this.supabase
+      .from("user_sticker_book")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("sticker_book_id", stickerBookId)
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    // create
+    if (!progress) {
+      const status = total === 1 ? "completed" : "in_progress";
+
+      await this.supabase.from("user_sticker_book").insert({
+        user_id: userId,
+        sticker_book_id: stickerBookId,
+        stickers_collected: [stickerId],
+        status,
+      });
+
+      return;
+    }
+
+    let updated = progress.stickers_collected ?? [];
+
+    if (!updated.includes(stickerId)) {
+      updated.push(stickerId);
+    }
+
+    let status = progress.status;
+
+    if (updated.length === total) {
+      status = "completed";
+    }
+
+    await this.supabase
+      .from("user_sticker_book")
+      .update({
+        stickers_collected: updated,
+        status,
+      })
+      .eq("id", progress.id)
+      .eq("is_deleted", false);
+  }
+  async isAssignmentAlreadyAssigned(
+    schoolId: string,
+    classId: string,
+    courseId: string,
+    chapterId: string,
+    lessonId: string,
+  ): Promise<boolean> {
+    if (!this.supabase) return false;
+
+    const { data, error } = await this.supabase
+      .from(TABLES.Assignment)
+      .select("id")
+      .eq("school_id", schoolId)
+      .eq("class_id", classId)
+      .eq("course_id", courseId)
+      .eq("chapter_id", chapterId)
+      .eq("lesson_id", lessonId)
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Error checking existing assignment:", error);
+      return false;
+    }
+
+    return !!data;
   }
 }

@@ -75,6 +75,7 @@ import {
   HOT_UPDATE_STATE_KEY,
   GrowthBookAttributes,
   LIDO_ASSESSMENT,
+  LATEST_LEARNING_PATH,
 } from "../common/constants";
 import { palUtil } from "./palUtil";
 import {
@@ -114,8 +115,9 @@ import CryptoJS from "crypto-js";
 import { InAppReview } from "@capacitor-community/in-app-review";
 import { ASSIGNMENT_COMPLETED_IDS } from "../common/courseConstants";
 import { v4 as uuidv4 } from "uuid";
-import { buildInitialLearningPath } from "../components/LearningPathway";
-import { updateLocalAttributes, useGbContext } from "../growthbook/Growthbook";
+import { updateLocalAttributes } from "../growthbook/Growthbook";
+import { recommendNextLesson } from "../hooks/useLearningPath";
+import { runBackgroundWorkerTask } from "../workers/backgroundWorkerClient";
 
 declare global {
   interface Window {
@@ -553,9 +555,32 @@ export class Util {
                 typeof zip.data === "string"
                   ? zip.data
                   : await this.blobToString(zip.data as Blob);
-              const buffer = Uint8Array.from(atob(zipDataStr), (c) =>
-                c.charCodeAt(0),
-              );
+
+              const preparedZip = await runBackgroundWorkerTask(
+                "PREPARE_BINARY_FROM_BASE64",
+                {
+                  base64: zipDataStr,
+                },
+              ).catch((error) => {
+                console.warn(
+                  `[LessonDownloader] Worker decode failed for lesson ${lessonId}, falling back to main thread decode.`,
+                  error,
+                );
+                const fallbackBuffer = Uint8Array.from(atob(zipDataStr), (c) =>
+                  c.charCodeAt(0),
+                );
+                return {
+                  byteLength: fallbackBuffer.byteLength,
+                  sha256Hex: "",
+                  arrayBuffer: fallbackBuffer.buffer,
+                };
+              });
+              const buffer = new Uint8Array(preparedZip.arrayBuffer);
+              if (preparedZip.sha256Hex) {
+                console.log(
+                  `[LessonDownloader] SHA-256 for ${lessonId}: ${preparedZip.sha256Hex}`,
+                );
+              }
 
               await unzip({
                 fs,
@@ -575,7 +600,10 @@ export class Util {
               const lessonData = JSON.parse(
                 localStorage.getItem("downloaded_lessons_size") || "{}",
               );
-              lessonData[lessonId] = { size: buffer.byteLength };
+              lessonData[lessonId] = {
+                size: preparedZip.byteLength,
+                sha256: preparedZip.sha256Hex || undefined,
+              };
               localStorage.setItem(
                 "downloaded_lessons_size",
                 JSON.stringify(lessonData),
@@ -700,9 +728,25 @@ export class Util {
       });
 
       if (!response?.data || response.status !== 200) return false;
-      const buffer = Uint8Array.from(atob(response.data), (c) =>
-        c.charCodeAt(0),
-      );
+      let buffer: Uint8Array;
+      try {
+        const prepared = await runBackgroundWorkerTask(
+          "PREPARE_BINARY_FROM_BASE64",
+          {
+            base64: response.data,
+            algorithm: "SHA-256",
+          },
+        );
+        buffer = new Uint8Array(prepared.arrayBuffer);
+      } catch (workerError) {
+        console.warn(
+          `[${assetType}] Worker decode failed, falling back to main thread decode.`,
+          workerError,
+        );
+        buffer = Uint8Array.from(atob(response.data), (c) =>
+          c.charCodeAt(0),
+        );
+      }
       await unzip({
         fs,
         extractTo: "", // The zip file itself should contain the destination folder
@@ -2949,46 +2993,45 @@ export class Util {
   ) {
     if (!currentStudent) return;
     const storedPathwayMode = localStorage.getItem(CURRENT_PATHWAY_MODE);
-    const learningPath = currentStudent.learning_path
-      ? JSON.parse(currentStudent.learning_path)
+    const pathToParse = Util.getLatestLearningPathByUpdatedAt(currentStudent);
+    const learningPath = pathToParse
+      ? JSON.parse(pathToParse)
       : null;
 
     if (!learningPath) return;
+    learningPath.updated_at = new Date().toISOString();
     // ABORT CASE: refresh current lesson with PAL recommendation only
     // ABORT CASE: Assessment aborted → rebuild learning path (legacy flow)
     if (isFullPathwayTerminated && abortCourseId && isAssessmentLesson) {
-      const courseIndex = learningPath.courses.courseList.findIndex(
+      let courseIndex = learningPath.courses.courseList.findIndex(
         (c: any) => c.course_id === abortCourseId,
       );
 
       if (courseIndex === -1) return;
 
-      // Rebuild learning path for ALL courses
-      const courses = learningPath.courses.courseList
-        .filter((c: any) => c.course_id === abortCourseId)
-        .map((c: any) => ({
-          id: c.course_id,
-          subject_id: c.subject_id,
+      const courses = learningPath.courses;
+      let course = courses.courseList[courseIndex];
+      course.path.length = 0;
+      const nextLesson = await recommendNextLesson({
+        student: currentStudent,
+        course: {
+          id: course.course_id,
+          subject_id: course.subject_id,
           framework_id:
-            c.type === RECOMMENDATION_TYPE.FRAMEWORK ? "framework" : null,
-        }));
+            course.type === RECOMMENDATION_TYPE.FRAMEWORK ? "framework" : null,
+        },
+        mode: storedPathwayMode || LEARNING_PATHWAY_MODE.DISABLED,
+        coursePath: course,
+      });
 
-      const rebuiltPath = await buildInitialLearningPath(
-        storedPathwayMode || LEARNING_PATHWAY_MODE.DISABLED,
-        courses,
-        currentStudent,
-      );
-      // 1️⃣ Get rebuilt course
-      const rebuiltCourse = rebuiltPath.courses.courseList[0];
-      if (!rebuiltCourse) return;
-      // 3️⃣ Replace ONLY that course
-      learningPath.courses.courseList[courseIndex] = {
-        ...learningPath.courses.courseList[courseIndex],
-        ...rebuiltCourse,
-      };
-
-      // 4️⃣ Keep pointer correct
-      learningPath.courses.currentCourseIndex = courseIndex;
+      if (nextLesson) {
+        course.path.push(nextLesson);
+      }
+      courseIndex += 1;
+      if (courseIndex >= courses.courseList.length) {
+        courseIndex = 0;
+      }
+      courses.currentCourseIndex = courseIndex;
 
       // 5️⃣ Save FULL learning path
       await ServiceConfig.getI().apiHandler.updateLearningPath(
@@ -3008,216 +3051,99 @@ export class Util {
     }
 
     try {
-      const { courses } = learningPath;
-      const currentCourse = courses.courseList[courses.currentCourseIndex];
-      let activeCourse = courses.courseList[courses.currentCourseIndex];
-      let activePathItem = activeCourse.path[activeCourse.currentIndex];
+      const PATH_SIZE = 5;
+      const api = ServiceConfig.getI().apiHandler;
 
+      const courses = learningPath.courses;
+      let courseIndex = courses.currentCourseIndex;
+      let course = courses.courseList[courseIndex];
+      if (!course) return;
+
+      /* 1️⃣ Identify active lesson */
+      const activeLessonIndex = course.path.findIndex(
+        (l: any) => l.isPlayed === false,
+      );
+      const activeLesson =
+        activeLessonIndex !== -1 ? course.path[activeLessonIndex] : null;
       const prevData = {
-        pathId: activeCourse.path_id,
-        courseId: activeCourse.course_id,
-        lessonId: activePathItem.lesson_id,
-        chapterId: activePathItem.chapter_id,
-        prevPath_id: activeCourse.path_id,
+        pathId: course.path_id,
+        courseId: course.course_id,
+        lessonId: activeLesson.lesson_id,
+        chapterId: activeLesson.chapter_id,
+        prevPath_id: course.path_id,
+      };
+      if (!activeLesson) return;
+
+      /* 2️⃣ Mark active lesson as played */
+      course.path[activeLessonIndex] = {
+        ...activeLesson,
+        isPlayed: true,
       };
 
-      const eventsToLog: string[] = [];
-      const advancePathSlice = () => {
-        const pathLen = currentCourse.path?.length ?? 0;
-        if (!pathLen) return;
-        const nextStartIndex = Math.max(
-          0,
-          Math.min(currentCourse.currentIndex, pathLen - 1),
-        );
-        const nextEndIndex = Math.max(
-          nextStartIndex,
-          Math.min(currentCourse.pathEndIndex + 5, pathLen - 1),
-        );
+      /* 3️⃣ Compute next active lesson */
+      const nextLesson = await recommendNextLesson({
+        student: currentStudent,
+        course: {
+          id: course.course_id,
+          subject_id: course.subject_id,
+          framework_id:
+            course.type === RECOMMENDATION_TYPE.FRAMEWORK ? "framework" : null,
+        },
+        mode: storedPathwayMode || LEARNING_PATHWAY_MODE.DISABLED,
+        coursePath: course,
+      });
 
-        currentCourse.startIndex = nextStartIndex;
-        currentCourse.currentIndex = nextStartIndex;
-        currentCourse.pathEndIndex = nextEndIndex;
-        currentCourse.path_id = uuidv4();
-        prevData.prevPath_id = currentCourse.path_id;
-      };
+      if (nextLesson) {
+        course.path.push(nextLesson);
+      }
 
-      currentCourse.currentIndex += 1;
-      const is_immediate_sync =
-        currentCourse.currentIndex >= currentCourse.pathEndIndex;
-      if (currentCourse.currentIndex > currentCourse.pathEndIndex) {
+      /* 4️⃣ Check path overflow */
+      let pathCompleted = false;
+
+      if (course.path.length > PATH_SIZE) {
+        // if exceeding max path size i.e '5', remove played lessons from old path keep active lesson from currentPath
+        const active = course.path.find((l: any) => !l.isPlayed);
+        course.path.length = 0;
+        course.path.push(active);
+        pathCompleted = true;
+      }
+
+      /* 5️⃣ Move course index if path completed */
+      if (pathCompleted) {
         if (isRewardLesson) {
           sessionStorage.setItem(
             REWARD_LEARNING_PATH,
             JSON.stringify(learningPath),
           );
         }
-
-        if (
-          learningPath.courses.courseList[
-            learningPath.courses.currentCourseIndex
-          ].type === RECOMMENDATION_TYPE.CHAPTER
-        ) {
-          currentCourse.startIndex = currentCourse.currentIndex;
-          currentCourse.pathEndIndex += 5;
-          currentCourse.path_id = uuidv4();
-          prevData.prevPath_id = currentCourse.path_id;
-
-          if (currentCourse.pathEndIndex > currentCourse.path.length) {
-            currentCourse.pathEndIndex = currentCourse.path.length - 1;
-          }
-        } else {
-          // ASSESSMENT COMPLETED CASE → rebuild initial learning path
-          if (
-            isAssessmentLesson &&
-            !isFullPathwayTerminated &&
-            storedPathwayMode === LEARNING_PATHWAY_MODE.ASSESSMENT_ONLY
-          ) {
-            const courseIndex = learningPath.courses.courseList.findIndex(
-              (c: any) => c.course_id === currentCourse.course_id,
-            );
-
-            if (courseIndex === -1) return;
-            const courses = learningPath.courses.courseList
-              .filter((c: any) => c.course_id === currentCourse.course_id)
-              .map((c: any) => ({
-                id: c.course_id,
-                subject_id: c.subject_id,
-                framework_id:
-                  c.type === RECOMMENDATION_TYPE.FRAMEWORK ? "framework" : null,
-              }));
-
-            const rebuiltPath = await buildInitialLearningPath(
-              storedPathwayMode,
-              courses,
-              currentStudent,
-            );
-            const rebuiltCourse = rebuiltPath.courses.courseList[0];
-            if (!rebuiltCourse) return;
-            // 3️⃣ Replace ONLY that course
-            learningPath.courses.courseList[courseIndex] = {
-              ...learningPath.courses.courseList[courseIndex],
-              ...rebuiltCourse,
-            };
-            // 4️⃣ Keep pointer correct
-            learningPath.courses.currentCourseIndex = courseIndex;
-            await ServiceConfig.getI().apiHandler.updateLearningPath(
-              currentStudent,
-              JSON.stringify(learningPath),
-              false,
-            );
-
-            const updatedStudent =
-              await ServiceConfig.getI().apiHandler.getUserByDocId(
-                currentStudent.id,
-              );
-
-            if (updatedStudent) {
-              Util.setCurrentStudent(updatedStudent);
-            }
-
-            return; // STOP further PAL / normal flow
-          }
-
-          if (storedPathwayMode === LEARNING_PATHWAY_MODE.FULL_ADAPTIVE) {
-            const palPath = await palUtil.getPalLessonPathForCourse(
-              currentCourse.course_id,
-              currentStudent.id,
-            );
-
-            if (palPath?.length) {
-              currentCourse.path_id = uuidv4();
-              currentCourse.path = palPath;
-              currentCourse.startIndex = 0;
-              currentCourse.currentIndex = 0;
-              currentCourse.pathEndIndex = palPath.length - 1;
-            } else {
-              advancePathSlice();
-            }
-          } else {
-            advancePathSlice();
-          }
-        }
-
-        courses.currentCourseIndex += 1;
-
+        const newpathId = uuidv4();
+        course.path_id = newpathId;
+        prevData.pathId = newpathId;
+        course.completedPath +=1;
+        courseIndex += 1;
         await ServiceConfig.getI().apiHandler.setStarsForStudents(
           currentStudent.id,
           10,
           false,
         );
-
-        if (courses.currentCourseIndex >= courses.courseList.length) {
-          courses.currentCourseIndex = 0;
+        if (courseIndex >= courses.courseList.length) {
+          courseIndex = 0;
         }
-
-        const pathwayEndData = {
-          user_id: currentStudent.id,
-          current_path_id:
-            learningPath.courses.courseList[
-              learningPath.courses.currentCourseIndex
-            ].path_id,
-          current_course_id:
-            learningPath.courses.courseList[
-              learningPath.courses.currentCourseIndex
-            ].course_id,
-          current_lesson_id:
-            learningPath.courses.courseList[
-              learningPath.courses.currentCourseIndex
-            ].path[
-              learningPath.courses.courseList[
-                learningPath.courses.currentCourseIndex
-              ].currentIndex
-            ].lesson_id,
-          current_chapter_id:
-            learningPath.courses.courseList[
-              learningPath.courses.currentCourseIndex
-            ].path[
-              learningPath.courses.courseList[
-                learningPath.courses.currentCourseIndex
-              ].currentIndex
-            ].chapter_id,
-          prev_path_id: prevData.pathId,
-          prev_course_id: prevData.courseId,
-          prev_lesson_id: prevData.lessonId,
-          prev_chapter_id: prevData.chapterId,
-        };
-
-        await Util.logEvent(EVENTS.PATHWAY_COMPLETED, pathwayEndData);
-        await Util.logEvent(EVENTS.PATHWAY_COURSE_CHANGED, pathwayEndData);
-      } else if (
-        !isAssessmentLesson &&
-        storedPathwayMode === LEARNING_PATHWAY_MODE.FULL_ADAPTIVE
-      ) {
-        const recommended = await palUtil.getRecommendedLessonForCourse(
-          currentStudent.id,
-          currentCourse.course_id,
-        );
-        if (recommended?.lesson?.id) {
-          currentCourse.path[currentCourse.currentIndex] = {
-            ...currentCourse.path[currentCourse.currentIndex],
-            lesson_id: recommended.lesson.id,
-            chapter_id: recommended.chapterId,
-            skill_id: recommended.skillId,
-          };
-        }
-        eventsToLog.push(
-          EVENTS.PATHWAY_COMPLETED,
-          EVENTS.PATHWAY_COURSE_CHANGED,
-        );
+        courses.currentCourseIndex = courseIndex;
       }
 
-      eventsToLog.push(EVENTS.PATHWAY_LESSON_END);
-
+      /* 6️⃣ Event collection */
       const newCourse = courses.courseList[courses.currentCourseIndex];
-      const newPathItem =
-        newCourse.path[newCourse.currentIndex] || newCourse.path[0];
+      const newActiveLesson = newCourse.path.find(
+        (l: any) => l.isPlayed === false,
+      );
 
       const eventPayload = {
         user_id: currentStudent.id,
         current_path_id: newCourse.path_id,
         current_course_id: newCourse.course_id,
-        current_lesson_id: newPathItem.lesson_id,
-        current_chapter_id: newPathItem.chapter_id,
+        current_lesson_id: newActiveLesson?.lesson_id ?? null,
+        current_chapter_id: newActiveLesson?.chapter_id ?? null,
         path_id: prevData.pathId,
         prev_path_id: prevData.prevPath_id,
         prev_course_id: prevData.courseId,
@@ -3226,24 +3152,66 @@ export class Util {
         timestamp: new Date().toISOString(),
       };
 
+      const events: EVENTS[] = [EVENTS.PATHWAY_LESSON_END];
+      if (pathCompleted) {
+        events.push(EVENTS.PATHWAY_COMPLETED, EVENTS.PATHWAY_COURSE_CHANGED);
+      }
+
+      /* 7️⃣ Persist + log */
       await Promise.all([
-        ServiceConfig.getI().apiHandler.updateLearningPath(
+        api.updateLearningPath(
           currentStudent,
           JSON.stringify(learningPath),
-          is_immediate_sync,
+          false,
         ),
-        ...eventsToLog.map((eventName) =>
-          Util.logEvent(eventName as EVENTS, eventPayload),
-        ),
+        ...events.map((e) => Util.logEvent(e, eventPayload)),
       ]);
-      // Update the current student object
-      const updatedStudent =
-        await ServiceConfig.getI().apiHandler.getUserByDocId(currentStudent.id);
+
+      const updatedStudent = await api.getUserByDocId(currentStudent.id);
       if (updatedStudent) {
         Util.setCurrentStudent(updatedStudent);
       }
     } catch (error) {
       console.error("Error updating learning path:", error);
+    }
+  }
+  
+  // this function is created because local sqlite database was updating after UI rendering,
+  // so it was showing old learning path until we refresh the page, 
+  // to avoid this checking the updated_at of learning path in session storage and database and returning the latest one 
+  public static getLatestLearningPathByUpdatedAt(
+    student: TableTypes<"user">
+  ): string | null {
+    try {
+      const sessionData = sessionStorage.getItem(LATEST_LEARNING_PATH);
+  
+      // If nothing in session storage, return DB value
+      if (!sessionData) {
+        return student?.learning_path ?? null;
+      }
+      const studentLearningPath = student.learning_path ? JSON.parse(student.learning_path) : null;
+      const parsed = JSON.parse(sessionData);
+  
+      // If session data belongs to different student, ignore it
+      if (parsed.studentId !== student.id) {
+        return student?.learning_path ?? null;
+      }
+  
+      const sessionUpdatedAt = new Date(parsed.updated_at).getTime();
+      const dbUpdatedAt = studentLearningPath?.updated_at
+        ? new Date(studentLearningPath.updated_at).getTime()
+        : 0;
+  
+      
+      // Compare timestamps
+      if (sessionUpdatedAt > dbUpdatedAt) {
+        return parsed.learningPath;
+      }
+  
+      return student?.learning_path ?? null;
+    } catch (error) {
+      console.error("Error resolving latest learning path:", error);
+      return student?.learning_path ?? null;
     }
   }
 
@@ -3609,7 +3577,23 @@ export class Util {
           ? download.data
           : await this.blobToString(download.data as Blob);
 
-      const buffer = Uint8Array.from(atob(zipDataStr), (c) => c.charCodeAt(0));
+      let buffer: Uint8Array;
+      try {
+        const prepared = await runBackgroundWorkerTask(
+          "PREPARE_BINARY_FROM_BASE64",
+          {
+            base64: zipDataStr,
+            algorithm: "SHA-256",
+          },
+        );
+        buffer = new Uint8Array(prepared.arrayBuffer);
+      } catch (workerError) {
+        console.warn(
+          "[LidoCommonAudio] Worker decode failed, falling back to main thread decode.",
+          workerError,
+        );
+        buffer = Uint8Array.from(atob(zipDataStr), (c) => c.charCodeAt(0));
+      }
 
       // 📦 Unzip to /Lido-CommonAudios/{languageId}
       await unzip({

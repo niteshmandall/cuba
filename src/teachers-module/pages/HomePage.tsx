@@ -11,10 +11,12 @@ import {
   registerPlugin,
 } from "@capacitor/core";
 import TeacherAssignment from "../components/homePage/assignment/TeacherAssignment";
+import AssignScreen from "../components/homePage/assignment/AssignScreen";
 import Library from "../components/library/Library";
 import ReportTable from "../components/reports/ReportsTable";
 import {
   CLASS_OR_SCHOOL_CHANGE_EVENT,
+  IS_OPS_USER,
   LANGUAGE,
   PAGES,
   STATUS,
@@ -45,8 +47,10 @@ const HomePage: React.FC = () => {
   // 1) Safely grab tabValue (default to 0)
   const initialTab = location.state?.tabValue ?? 0;
   const [tabValue, setTabValue] = useState<number>(initialTab);
+  const [showAssignOptionsScreen, setShowAssignOptionsScreen] = useState(true);
+  const [autoStartScan, setAutoStartScan] = useState(false);
   const [currentClass, setCurrentClass] = useState<TableTypes<"class"> | null>(
-    null
+    null,
   );
   const currentSchool = Util.getCurrentSchool();
   const [refresh, setRefresh] = useState(false);
@@ -55,6 +59,7 @@ const HomePage: React.FC = () => {
   const [renderKey, setRenderKey] = useState(0);
   const PortPlugin = registerPlugin<any>("Port");
   const { setGbUpdated } = useGbContext();
+  const isOpsUser = localStorage.getItem(IS_OPS_USER) === "true";
   useEffect(() => {
     init();
 
@@ -78,7 +83,7 @@ const HomePage: React.FC = () => {
     return () => {
       window.removeEventListener(
         CLASS_OR_SCHOOL_CHANGE_EVENT,
-        handleClassChange
+        handleClassChange,
       );
       listener?.remove();
     };
@@ -107,18 +112,22 @@ const HomePage: React.FC = () => {
     const languageCode = localStorage.getItem(LANGUAGE);
     await Util.updateUserLanguage(languageCode!);
 
-    const existingRequest = await api.getExistingSchoolRequest(currentUser?.id as string);
-    if(existingRequest && existingRequest.request_status ===  STATUS.REQUESTED) history.replace(PAGES.POST_SUCCESS)
+    const existingRequest = await api.getExistingSchoolRequest(
+      currentUser?.id as string,
+    );
+    if (existingRequest && existingRequest.request_status === STATUS.REQUESTED)
+      history.replace(PAGES.POST_SUCCESS);
     await Util.handleClassAndSubjects(
       currentSchool?.id!,
       currentUser?.id!,
       history,
-      PAGES.HOME_PAGE
+      PAGES.HOME_PAGE,
     );
     await fetchClassDetails();
   };
   const handleChange = (event: React.SyntheticEvent, newValue: number) => {
     // preserve whatever state you need when switching
+    setShowAssignOptionsScreen(true);
     setTabValue(newValue);
   };
   const renderComponent = () => {
@@ -129,8 +138,35 @@ const HomePage: React.FC = () => {
       case 1:
         return <Library key={key} />;
       case 2:
+        if (showAssignOptionsScreen) {
+          return (
+            <AssignScreen
+              key={key}
+              onLibraryClick={() => {
+                setShowAssignOptionsScreen(true);
+                setTabValue(1);
+              }}
+              onScanQrClick={() => {
+                setShowAssignOptionsScreen(false);
+                setAutoStartScan(true);
+              }}
+              onRecommendedClick={() => {
+                history.replace(PAGES.TEACHER_RECOMMENDED_ASSIGNMENTS);
+                setShowAssignOptionsScreen(false);
+              }}
+            />
+          );
+        }
         return (
-          <TeacherAssignment key={key} onLibraryClick={() => setTabValue(1)} />
+          <TeacherAssignment
+            key={key}
+            autoStartScan={autoStartScan}
+            onScanHandled={() => setAutoStartScan(false)}
+            onLibraryClick={() => {
+              setShowAssignOptionsScreen(true);
+              setTabValue(1);
+            }}
+          />
         );
       case 3:
         return (
@@ -163,7 +199,7 @@ const HomePage: React.FC = () => {
   const handleShare = async () => {
     if (tabValue !== 3) return;
     const el = document.querySelector(
-      ".Reports-Table-capture-report-table"
+      ".Reports-Table-capture-report-table",
     ) as HTMLElement | null;
     if (!el) return;
     const prevMargin = el.style.marginTop;
@@ -180,7 +216,7 @@ const HomePage: React.FC = () => {
           "Report screenshot attached.",
           "Report Screenshot",
           undefined,
-          [file]
+          [file],
         );
       } else {
         const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
@@ -203,33 +239,47 @@ const HomePage: React.FC = () => {
       el.style.marginTop = prevMargin;
     }
   };
+  const handleLibraryBack = () => {
+    setShowAssignOptionsScreen(true);
+    setTabValue(2);
+    history.replace(PAGES.HOME_PAGE, { tabValue: 2 });
+  };
+  const isLibraryTab = tabValue === 1;
+  const footerTabValue = tabValue === 1 ? 2 : tabValue;
   return (
     <div className="main-container" key={renderKey}>
       <Header
-        showSchool
-        showClass
+        isBackButton={isLibraryTab}
+        showSchool={!isLibraryTab}
+        showClass={!isLibraryTab}
         className={currentClass?.name}
         schoolName={currentSchool?.name}
-        isBackButton={false}
-        showSideMenu
+        showSideMenu={!isLibraryTab}
+        customText={isLibraryTab ? "Library" : ""}
+        onBackButtonClick={isLibraryTab ? handleLibraryBack : undefined}
+        showSearchIcon={isLibraryTab && !isOpsUser}
+        onSearchIconClick={
+          isLibraryTab ? () => history.replace(PAGES.SEARCH_LESSON) : undefined
+        }
         onShareClick={tabValue === 3 ? handleShare : undefined}
       />
       <main className="home-container-body">{renderComponent()}</main>
       <footer className="container-footer">
         <BottomNavigation
-          value={tabValue}
+          value={footerTabValue}
           onChange={handleChange}
           className="homepage-bottom-nav"
           showLabels
           style={{ height: "10vh" }}
         >
           <BottomNavigationAction
+            value={0}
             label={t("Home")}
             icon={
               <img
                 className="footerIcons"
                 src={
-                  tabValue === 0
+                  footerTabValue === 0
                     ? "assets/icons/homeSelected.png"
                     : "assets/icons/home.png"
                 }
@@ -237,7 +287,7 @@ const HomePage: React.FC = () => {
               />
             }
           />
-          <BottomNavigationAction
+          {/* <BottomNavigationAction
             label={t("Library")}
             icon={
               <img
@@ -250,14 +300,15 @@ const HomePage: React.FC = () => {
                 alt=""
               />
             }
-          />
+          /> */}
           <BottomNavigationAction
+            value={2}
             label={t("Assign")}
             icon={
               <img
                 className="footerIcons"
                 src={
-                  tabValue === 2
+                  footerTabValue === 2
                     ? "assets/icons/assignmentSelected.png"
                     : "assets/icons/assignmentfooter.png"
                 }
@@ -267,12 +318,13 @@ const HomePage: React.FC = () => {
             className="middle-action"
           />
           <BottomNavigationAction
+            value={3}
             label={t("Reports")}
             icon={
               <img
                 className="footerIcons"
                 src={
-                  tabValue === 3
+                  footerTabValue === 3
                     ? "assets/icons/reportSelected.png"
                     : "assets/icons/report.png"
                 }
@@ -281,12 +333,13 @@ const HomePage: React.FC = () => {
             }
           />
           <BottomNavigationAction
+            value={4}
             label="AI"
             icon={
               <img
                 className="footerIcons"
                 src={
-                  tabValue === 4
+                  footerTabValue === 4
                     ? "assets/icons/aiSelected.png"
                     : "assets/icons/ai.png"
                 }

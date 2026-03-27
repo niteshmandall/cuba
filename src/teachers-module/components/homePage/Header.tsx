@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import "./Header.css";
 import HelpOutlineOutlinedIcon from "@mui/icons-material/HelpOutlineOutlined";
 import KeyboardBackspaceIcon from "@mui/icons-material/KeyboardBackspace";
@@ -22,6 +22,7 @@ import SideMenu from "./SideMenu";
 import { t } from "i18next";
 import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import { IoShareSocialSharp } from "react-icons/io5";
+import { registerBackButtonHandler } from "../../../common/backButtonRegistry";
 
 // Updated DrawerOptions to include User Profile
 const iconMapping: Record<DrawerOptions, SvgIconComponent> = {
@@ -41,7 +42,10 @@ interface HeaderProps {
   disableBackButton?: boolean;
   showSideMenu?: boolean;
   customText?: string;
+  customTextClassName?: string;
   onSearchChange?: (value: string) => void; // New prop for search input changes
+  showSearchIcon?: boolean;
+  onSearchIconClick?: () => void;
   onShareClick?: () => void;
 }
 
@@ -56,7 +60,10 @@ const Header: React.FC<HeaderProps> = ({
   disableBackButton = false,
   showSideMenu = false,
   customText = "",
+  customTextClassName = "",
   onSearchChange,
+  showSearchIcon = false,
+  onSearchIconClick,
   onShareClick,
 }) => {
   const history = useHistory();
@@ -87,8 +94,17 @@ const Header: React.FC<HeaderProps> = ({
     }
   };
 
-  const handleBackButtonClick = () => {
-    if (disableBackButton) return;
+  const handleBackButtonClick = useCallback(() => {
+    if (disableBackButton) {
+      return;
+    }
+
+    // If drawer is open, close it first
+    if (isDrawerOpen) {
+      setIsDrawerOpen(false);
+      return;
+    }
+
     if (onBackButtonClick) {
       onBackButtonClick();
     } else if (onButtonClick) {
@@ -96,7 +112,30 @@ const Header: React.FC<HeaderProps> = ({
     } else {
       Util.setPathToBackButton(PAGES.HOME_PAGE, history);
     }
-  };
+  }, [
+    disableBackButton,
+    onBackButtonClick,
+    onButtonClick,
+    history,
+    isDrawerOpen,
+  ]);
+
+  const handleBackRef = React.useRef<() => void>(() => {});
+
+  useEffect(() => {
+    handleBackRef.current = handleBackButtonClick;
+  }, [handleBackButtonClick]);
+
+  useEffect(() => {
+    if (!isBackButton || disableBackButton) {
+      return;
+    }
+
+    const unregister = registerBackButtonHandler(() => {
+      return handleBackRef.current();
+    });
+    return unregister;
+  }, [isBackButton, disableBackButton]);
 
   return (
     <header className="header-container">
@@ -120,7 +159,9 @@ const Header: React.FC<HeaderProps> = ({
             />
           ) : null}
           {customText ? (
-            <div className="header-custom-text">{t(customText)}</div>
+            <div className={customTextClassName || "header-custom-text"}>
+              {t(customText)}
+            </div>
           ) : (
             <div className="left-content">
               {showClass && className && (
@@ -158,47 +199,52 @@ const Header: React.FC<HeaderProps> = ({
           </Box>
         </Drawer>
 
-        <div className="search-section">
-          {onSearchChange && (
-            <div className="header-search-container">
-              <SearchOutlinedIcon className="search-icon-inside" />
-              <input
-                type="text"
-                className="header-search-input"
-                placeholder={String(t("Search School"))}
-                onChange={(e) => onSearchChange(e.target.value)}
-              />
-            </div>
-          )}
-          <div
-            className="help-icon-container"
-            style={{ display: "flex", alignItems: "center" }}
-          >
+        <div className="header-actions-container">
+          <div className="search-section">
             {onShareClick && (
               <button
                 onClick={onShareClick}
-                style={{
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                  padding: 0,
-                  marginLeft: 8,
-                  marginTop: 4,
-                }}
+                id="header-share-icon-button"
+                className="header-share-icon-button"
+                type="button"
+                aria-label={String(t("Share"))}
               >
                 <IoShareSocialSharp size={28} color="white" />
               </button>
             )}
-           
+            {showSearchIcon && (
+              <button
+                type="button"
+                className="header-search-icon-button"
+                aria-label={String(t("Search"))}
+                onClick={onSearchIconClick}
+              >
+                <SearchOutlinedIcon className="header-search-action-icon" />
+              </button>
+            )}
+            {onSearchChange && (
+              <div className="header-search-container">
+                <SearchOutlinedIcon
+                  id="header-search-icon-inside"
+                  className="header-search-icon-inside"
+                />
+                <input
+                  type="text"
+                  className="header-search-input"
+                  placeholder={String(t("Search School"))}
+                  onChange={(e) => onSearchChange(e.target.value)}
+                />
+              </div>
+            )}
+          </div>
+          <div className="help-icon-container">
+            <img
+              src="assets/icons/helpIcon.svg"
+              alt={String(t("Menu"))}
+              className="help-icon"
+            />
           </div>
         </div>
-         <div className="help-icon-container">
-              <img
-                src="assets/icons/helpIcon.svg"
-                alt={String(t("Menu"))}
-                className="help-icon"
-              />
-            </div>
       </div>
     </header>
   );

@@ -33,30 +33,34 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
   const [classDoc, setClassDoc] = useState<TableTypes<"class">>();
   const [isChangingGroup, setIsChangingGroup] = useState(false);
   useEffect(() => {
-    if (!groupId || !bot) {
-      resetPopup();
-      setIsChangingGroup(true);
-      return;
-    }
-    const getGroup = async () => {
+    if (!classData?.id) return;
+
+    const init = async () => {
       try {
-        const updatedClass = await api.getClassById(classData?.id!);
+        const updatedClass = await api.getClassById(classData.id);
         if (updatedClass) setClassDoc(updatedClass);
+
+        if (!updatedClass?.group_id || !bot) {
+          resetPopup();
+          setIsChangingGroup(true);
+          return;
+        }
+
         const group = await api.getWhatsappGroupDetails(
-          updatedClass?.group_id!,
-          bot!
+          updatedClass.group_id,
+          bot,
         );
         setGroupName(group.name);
         setEditedGroupName(group.name);
         setMembers(group.members.length);
         setInviteLink(group.inviteLink);
       } catch (err) {
-        console.error("Failed to fetch WhatsApp group:", err);
+        console.error("Failed to fetch data:", err);
       }
     };
 
-    getGroup();
-  }, [groupId, bot, api, classData?.id]);
+    init();
+  }, [classData?.id, bot]);
 
   const handleEdit = () => {
     setEditedGroupName(groupName ?? "");
@@ -72,11 +76,10 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
     if (!groupId || !bot) return;
 
     setIsSaving(true);
-
     const success = await api.updateWhatsAppGroupSettings(
-      groupId,
+      classDoc?.group_id ?? "",
       bot,
-      editedGroupName
+      editedGroupName,
     );
     setIsSaving(false);
 
@@ -89,7 +92,7 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
   const normalizeInviteLink = (input: string): string | null => {
     const trimmed = input.trim();
     const regex =
-      /^https:\/\/chat\.whatsapp\.com\/(invite\/)?([A-Za-z0-9]{10,})$/;
+      /^https:\/\/chat\.whatsapp\.com\/(invite\/)?([A-Za-z0-9]{10,})(\?.*)?$/;
 
     const match = trimmed.match(regex);
     if (!match) return null;
@@ -119,16 +122,20 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
       const result = await api.getWhatsAppGroupByInviteLink(
         normalized,
         bot,
-        classDoc?.id!
+        classDoc?.id!,
       );
-      if (!result) {
+      if (result) {
+        setGroupName(result.group_name);
+        setMembers(result.members);
+        setInviteLink(normalized);
+        setClassDoc((prev) =>
+          prev ? { ...prev, group_id: result.group_id } : prev,
+        );
+        setIsChangingGroup(false);
+      } else {
         setError(t("No WhatsApp group found for this invite link"));
         return;
       }
-      setGroupName(result.group_name);
-      setMembers(result.members);
-      setInviteLink(normalized);
-      setIsChangingGroup(false);
     } catch (err) {
       console.error(err);
       setError(t("Something went wrong. Please try again."));
@@ -183,6 +190,7 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
                   setInviteInput={setInviteInput}
                   error={error}
                   loading={loading}
+                  groupId={groupId || classDoc?.group_id}
                   onSubmit={handleInviteSubmit}
                   onCancel={() => {
                     setIsChangingGroup(false);
@@ -260,7 +268,11 @@ const WhatsAppInfoCard: React.FC<WhatsAppInfoCardProps> = ({
                 <Typography variant="caption" color="text.secondary">
                   {t("Members Count")}
                 </Typography>
-                <Typography variant="body1" fontWeight={700}>
+                <Typography
+                  variant="body1"
+                  className="wa-value"
+                  fontWeight={700}
+                >
                   {members ? members - 1 : 0} {t("Members")}
                 </Typography>
               </Box>
